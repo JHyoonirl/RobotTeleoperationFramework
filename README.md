@@ -13,28 +13,43 @@ Neuromeka Indy7 조작 및 task-space MPC 실험을 위한 ROS 2 저장소입니
 ## Directory layout
 
 ```text
-manipulator/
-├── indy7_mpc_test.py
-├── requirements-crocoddyl.txt
-└── ros2_ws/
-    ├── README.md
-    └── src/
-        └── indy7_mpc/
-            ├── config/
-            ├── launch/
-            ├── meshes/
-            ├── urdf/
-            └── indy7_mpc/
+.
+├── docker/
+│   ├── Dockerfile
+│   └── entrypoint.sh
+├── Makefile
+├── manipulator/
+│   ├── indy7_mpc_test.py
+│   ├── requirements-crocoddyl.txt
+│   └── ros2_ws/
+│       ├── README.md
+│       └── src/indy7_mpc/
+│           ├── config/
+│           ├── launch/
+│           ├── meshes/
+│           ├── urdf/
+│           └── indy7_mpc/
+└── README.md
 ```
 
 `build/`, `install/`, `log/`, `logs/`, `.venv/`는 로컬 생성물이라 Git에 넣지 않습니다.
+Docker 이미지도 Git에 넣지 않습니다. Git에는 이미지를 만드는 `docker/Dockerfile`과
+실행 초기화를 담당하는 `docker/entrypoint.sh`만 포함합니다.
 
 ## Requirements
+
+### Native setup
 
 - Ubuntu 환경의 ROS 2 Jazzy
 - Python 3.12 권장
 - `colcon`, `rosdep`, `python3-venv`
 - Crocoddyl, Pinocchio, NumPy 등은 `manipulator/requirements-crocoddyl.txt`로 설치
+
+### Docker setup
+
+- Docker Engine 또는 Docker Desktop
+- Docker BuildKit/buildx 권장
+- 호스트의 ROS 2, Python virtualenv, Crocoddyl 설치는 필요하지 않음
 
 ## Clone and build
 
@@ -91,23 +106,36 @@ python manipulator/indy7_mpc_test.py
 
 ## Docker
 
-Docker는 ROS 2 Jazzy, `ros2_control` mock hardware, Crocoddyl/Pinocchio와
-패키지 테스트를 이미지 빌드 단계에서 함께 설치·검증합니다. 기본 실행은 GUI 없는
-시뮬레이션입니다.
+`docker/Dockerfile`은 저장소를 실행 가능한 Docker 이미지로 만드는 빌드 레시피입니다.
+이미지 자체는 GitHub에 업로드하지 않으며, 사용자가 clone한 뒤 각 환경에서 직접
+빌드합니다. Dockerfile은 ROS 2 Jazzy, `ros2_control` mock hardware,
+Crocoddyl/Pinocchio를 설치하고 이미지 빌드 중 패키지 테스트까지 실행합니다.
+
+기본 이미지는 GUI 없는 headless 시뮬레이션으로 실행됩니다.
+
+```bash
+make docker-build
+make docker-test
+make docker-run
+```
+
+위 명령은 각각 이미지를 만들고, 이미지에 기록된 테스트 결과를 확인하고, ROS 2
+시뮬레이션을 실행합니다. 같은 작업을 Docker 명령으로 직접 실행할 수도 있습니다.
 
 ```bash
 docker build -f docker/Dockerfile -t robot-teleoperation-framework .
 docker run --rm --net=host --ipc=host robot-teleoperation-framework
 ```
 
-빌드된 이미지의 테스트 결과만 다시 확인하려면 다음을 실행합니다.
+`docker build`로 생성되는 이미지는 ROS/RViz 및 Python 과학 계산 의존성을 포함하므로
+로컬에서 수 GB가 될 수 있습니다. 이는 Git 저장소 크기나 Dockerfile 크기가 아니라
+Docker host에 저장되는 빌드 결과물입니다.
 
-```bash
-make docker-test
-```
+RViz나 실시간 plot을 사용하려면 X11/Wayland 전달 설정이 추가로 필요합니다. GUI를
+사용하지 않는 서버·CI 환경에서는 기본 headless 실행을 사용합니다.
 
-RViz나 실시간 plot을 사용할 때는 X11/Wayland 전달이 필요하므로, headless 기본값을
-유지한 채 필요한 경우 launch 인자를 직접 덮어씁니다.
+실제 로봇 연결용 IndyDCP3 adapter, deadman/E-stop, 충돌 감시는 Dockerfile에도
+포함되어 있지 않습니다. 현재 Docker 실행은 mock hardware 시뮬레이션 검증용입니다.
 
 ## Release checklist
 
