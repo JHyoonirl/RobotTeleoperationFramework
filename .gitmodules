@@ -1,0 +1,3 @@
+[submodule "manipulator/ros2_ws/src/vive_tracker_ros2"]
+	path = manipulator/ros2_ws/src/vive_tracker_ros2
+	url = https://github.com/JHyoonirl/vive_tracker_ros2.git
