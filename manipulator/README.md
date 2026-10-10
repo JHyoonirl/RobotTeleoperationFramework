@@ -1,18 +1,42 @@
 # Indy7 MPC 시작점
 
-`indy7_mpc_test.py`는 Neuromeka Indy7(6-DOF)의 관절 위치 추종을 위한 안전한 MPC 드라이런이다. ROS2 MPC는 Crocoddyl의 첫 예측 관절 위치를 `q_cmd`로 발행하고, 시뮬레이션에서는 `forward_position_controller`, 실기에서는 IndyDCP3 teleoperation adapter로 연결한다.
+이 디렉터리의 실행·검증은 Docker 컨테이너 안에서 수행합니다. 호스트에서 Python
+virtualenv를 만들거나 ROS 2를 source할 필요가 없습니다.
+
+저장소 루트에서 이미지를 먼저 빌드합니다.
 
 ```bash
 cd /path/to/RobotTeleoperationFramework
-.venv/bin/python manipulator/indy7_mpc_test.py
+make docker-build
 ```
 
-목표는 라디안 6개로 지정한다.
+`indy7_mpc_test.py`는 Neuromeka Indy7(6-DOF)의 관절 위치 추종을 위한 ROS 2와 분리된
+최소 MPC 드라이런입니다.
 
 ```bash
-.venv/bin/python manipulator/indy7_mpc_test.py --target '0.1,-0.2,0.3,0,0.2,-0.1'
+docker run --rm robot-teleoperation-framework \
+  python3 indy7_mpc_test.py
 ```
 
-실장 전에는 Indy7 드라이버에서 매 주기 `position`, `velocity`를 읽고 `q_cmd`를 IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()`로 전달해야 한다. 변환에는 실제 조인트 제한, 통신 watchdog, 충돌 감시, 비상정지, deadman 스위치가 필요하다.
+목표는 라디안 6개로 지정합니다.
 
-ROS2 + Crocoddyl 패키지는 [`ros2_ws/README.md`](ros2_ws/README.md)를 참고한다.
+```bash
+docker run --rm robot-teleoperation-framework \
+  python3 indy7_mpc_test.py \
+  --target '0.1,-0.2,0.3,0,0.2,-0.1'
+```
+
+ROS 2 패키지의 mock hardware 시뮬레이션은 다음처럼 실행합니다.
+
+```bash
+docker run --rm --net=host --ipc=host \
+  robot-teleoperation-framework
+```
+
+상세한 launch 옵션, 토픽, YAML 파라미터, 로그 분석, 실기 adapter 경계는
+[`ros2_ws/README.md`](ros2_ws/README.md)를 참고합니다.
+
+실장 전에는 Indy7 드라이버에서 매 주기 `position`, `velocity`를 읽고
+`mpc/joint_position_cmd`를 IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()`로 전달해야
+합니다. 변환에는 실제 joint limit, 통신 watchdog, 충돌 감시, 비상정지, deadman 스위치가
+필요합니다.

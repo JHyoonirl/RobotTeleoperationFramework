@@ -15,34 +15,55 @@ Pinocchio ABA가 질량행렬·중력·코리올리 항을 반영해 다음 상�
 `forward_position_controller`에 연결하고, 실기에서는 같은 토픽을
 IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()` adapter에 연결한다.
 
-## 설치
+## Docker 실행환경
 
-ROS2 환경을 먼저 source한 뒤 Crocoddyl 의존성을 설치한다. Crocoddyl 공식 설치 문서의 pip 방식을 따른다.
+이 문서의 모든 ROS 2 명령은 Docker 컨테이너 안에서 실행한다. 호스트에서 ROS 2를
+설치하거나 `.venv`를 만들거나 `rosdep`를 실행하지 않는다. 의존성 설치, colcon build,
+패키지 테스트는 저장소 루트의 `docker/Dockerfile`에 고정되어 있다.
 
-```bash
-export ROS_DISTRO=${ROS_DISTRO:-jazzy}
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-source /opt/ros/$ROS_DISTRO/setup.bash
-source "$REPO_ROOT/.venv/bin/activate"
-python3 -m pip install -r "$REPO_ROOT/manipulator/requirements-crocoddyl.txt"
-cd "$REPO_ROOT/manipulator/ros2_ws"
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install
-source install/setup.bash
-```
-
-`python3 -m pip`와 `ros2 launch`는 반드시 위에서 활성화한 동일한
-`$REPO_ROOT/.venv`에서 실행한다. 설치 확인:
+저장소 루트에서 이미지를 빌드하고 테스트한다.
 
 ```bash
-python3 -c "import crocoddyl, pinocchio; print(crocoddyl.__version__, pinocchio.__version__)"
+cd /path/to/RobotTeleoperationFramework
+make docker-build
+make docker-test
 ```
+
+이미지 안에는 다음 경로로 빌드된 ROS 2 workspace가 있다.
+
+```text
+/opt/robot_teleoperation_framework/src
+/opt/robot_teleoperation_framework/install
+```
+
+기본 이미지 이름은 `robot-teleoperation-framework`이며, 다른 이름을 사용하면 이후
+명령의 이미지 이름도 동일하게 바꾼다.
 
 ## 실행
 
 ```bash
-ros2 launch indy7_mpc indy7_mpc.launch.py
+docker run --rm --net=host --ipc=host \
+  robot-teleoperation-framework
 ```
+
+위 명령은 이미지에 정의된 headless 기본 launch를 실행한다. launch 인자를 바꾸려면
+이미지의 기본 명령을 덮어쓴다.
+
+```bash
+docker run --rm --net=host --ipc=host \
+  robot-teleoperation-framework \
+  ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
+```
+
+토픽 확인이나 로그 분석을 위해 컨테이너를 백그라운드에서 유지하려면 이름을 지정한다.
+
+```bash
+docker run -d --name robot-teleoperation --net=host --ipc=host \
+  robot-teleoperation-framework
+docker logs -f robot-teleoperation
+```
+
+이후의 `docker exec robot-teleoperation ...` 명령은 이 컨테이너가 실행 중이라는 전제다.
 
 기본값은 `config/indy7_mpc.yaml`을 읽는 시뮬레이션 모드이며, `tcp` frame의 SE(3) 목표를 직접 추적한다. DLS IK는 `qref` 진단용으로만 남아 있으며,
 MPC의 tracking residual은 Pinocchio forward kinematics로 매 stage 계산된다.
@@ -60,7 +81,8 @@ Task-space 목표는 horizon의 모든 단계에서 같은 최종 pose를 추적
 RViz 설정(`config/indy7.rviz`)은 로봇 Alpha를 `0.5`로 표시하고 `tcp` TF 기준의 TCP Axes display를 항상 켠다.
 launch를 실행하면 `mpc_plotter`가 함께 열려 position/orientation 오차, 전체 cost, solver 성공 여부·계산시간, control norm, 최소 joint-limit 여유를 실시간으로 표시한다. GUI가 없는 환경에서는 `plot:=false`로 끌 수 있다.
 
-동시에 진단 로그가 기본적으로 `ros2_ws/logs/indy7_mpc/<UTC timestamp>/trace.jsonl`에 저장된다.
+동시에 진단 로그가 기본적으로 컨테이너 내부의
+`/opt/robot_teleoperation_framework/logs/indy7_mpc/<UTC timestamp>/trace.jsonl`에 저장된다.
 각 줄은 한 MPC 주기의 JSON record이며 현재/목표 pose, local SE(3) 오차, q/qdot/qref,
 hard·soft joint-limit 여유, raw torque와 ABA 동역학 항, cost 항, solver 결과, TCP Jacobian의
 singular value/condition number, 월드 Z 회전에 필요한 추정 qdot, teleop pose 갱신 주기와
@@ -68,6 +90,15 @@ singular value/condition number, 월드 Z 회전에 필요한 추정 qdot, teleo
 같은 디렉터리의 `parameters.json`은 해당 실행의 파라미터 snapshot이다.
 기록을 끄거나 저장 위치를 바꾸려면 YAML의 `diagnostic_logging`,
 `diagnostic_log_directory`, `diagnostic_log_prediction`을 수정한다.
+`--rm`으로 컨테이너를 제거하면 컨테이너 내부 로그도 함께 사라지므로 보존하려면
+앞의 백그라운드 실행 명령 대신 호스트 디렉터리를 로그 경로에 bind mount한다.
+
+```bash
+mkdir -p .docker-data/logs
+docker run -d --name robot-teleoperation --net=host --ipc=host \
+  -v "$PWD/.docker-data/logs:/opt/robot_teleoperation_framework/logs" \
+  robot-teleoperation-framework
+```
 
 토픽은 다음과 같다.
 
@@ -89,7 +120,11 @@ singular value/condition number, 월드 Z 회전에 필요한 추정 qdot, teleo
 그리려면 다음을 실행한다.
 
 ```bash
-ros2 run indy7_mpc plot_mpc_log logs/indy7_mpc/<UTC timestamp>
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 run indy7_mpc plot_mpc_log \
+   /opt/robot_teleoperation_framework/logs/indy7_mpc/<UTC timestamp>'
 ```
 
 실행 디렉터리의 `plots/overview.png`, `plots/cartesian_path.png`,
@@ -117,37 +152,62 @@ orientation 기준은 `cartesian_max_angular_speed`에 의해 별도로 제한�
 키보드로 desired TCP pose를 조작하려면 MPC를 실행한 터미널과 별도의 터미널에서 다음을 실행한다.
 
 ```bash
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-cd "$REPO_ROOT/manipulator/ros2_ws"
-source /opt/ros/jazzy/setup.bash
-source "$REPO_ROOT/.venv/bin/activate"
-source install/setup.bash
-ros2 run indy7_mpc keyboard_teleop
+docker exec -it robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 run indy7_mpc keyboard_teleop'
 ```
 
 `w/s`, `a/d`, `r/f`는 각각 world 기준 x/y/z 이동이고, `u/o`, `i/k`, `j/l`은 roll/pitch/yaw 회전이다. `space`는 초기 pose로 복귀하고 `q`는 종료한다. 기본 이동량은 1 cm, 회전량은 5 deg이며 ROS parameter로 조절할 수 있다.
 
 ```bash
-ros2 topic echo /mpc/cost
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic echo /mpc/cost'
 ```
 
 목표 pose와 실제 pose를 함께 확인하려면:
 
 ```bash
-ros2 topic echo /mpc/desired_pose
-ros2 topic echo /mpc/current_pose
-ros2 topic echo /mpc/command_pose
-ros2 topic echo /mpc/joint_position_cmd
-ros2 topic echo /mpc/task_error
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic echo /mpc/desired_pose'
+
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic echo /mpc/current_pose'
+
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic echo /mpc/command_pose'
+
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic echo /mpc/joint_position_cmd'
+
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic echo /mpc/task_error'
 ```
 
 실험별 목표·MPC·cost 값은 소스 코드를 수정하지 말고 YAML을 복사해서 관리한다.
 
 ```bash
-cp src/indy7_mpc/config/indy7_mpc.yaml src/indy7_mpc/config/my_experiment.yaml
+mkdir -p .docker-data
+cp manipulator/ros2_ws/src/indy7_mpc/config/indy7_mpc.yaml \
+  .docker-data/my_experiment.yaml
 # my_experiment.yaml의 goal_position/goal_orientation_xyzw와 가중치를 수정
-ros2 launch indy7_mpc indy7_mpc.launch.py \
-  config_file:=$(pwd)/src/indy7_mpc/config/my_experiment.yaml
+docker run --rm --net=host --ipc=host \
+  -v "$PWD/.docker-data/my_experiment.yaml:/tmp/my_experiment.yaml:ro" \
+  robot-teleoperation-framework \
+  ros2 launch indy7_mpc indy7_mpc.launch.py \
+  config_file:=/tmp/my_experiment.yaml
 ```
 
 기본 목적함수는 다음과 같다.
@@ -194,14 +254,20 @@ goal 근처에서 떨리면 `velocity_cost_weight`, `torque_cost_weight`,
 시뮬레이션을 끄고 외부 joint state를 사용하려면:
 
 ```bash
-ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=false
+docker run --rm --net=host --ipc=host \
+  robot-teleoperation-framework \
+  ros2 launch indy7_mpc indy7_mpc.launch.py \
+  simulate:=false rviz:=false plot:=false
 ```
 
 YAML의 초기 SE(3) 목표를 바꾸려면 `goal_position`과 `goal_orientation_xyzw`를 수정한다. Teleoperation 중에는 다음처럼 `PoseStamped`를 발행하면 목표가 실시간으로 바뀐다.
 
 ```bash
-ros2 topic pub --rate 30 /teleop/target_pose geometry_msgs/msg/PoseStamped \
-  "{header: {frame_id: world}, pose: {position: {x: 0.55, y: -0.03, z: 0.50}, orientation: {x: -0.02, y: 0.99, z: 0.12, w: 0.10}}}"
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic pub --rate 30 /teleop/target_pose geometry_msgs/msg/PoseStamped \
+   "{header: {frame_id: world}, pose: {position: {x: 0.55, y: -0.03, z: 0.50}, orientation: {x: -0.02, y: 0.99, z: 0.12, w: 0.10}}}"'
 ```
 
 실기 연결은 다음 단계에서 IndyDCP3 client를 사용하는 별도 adapter를 붙인다. adapter는 `mpc/joint_position_cmd`를 구독해 `TELE_JOINT_ABSOLUTE` 모드의 `movetelej_abs()`로 전달한다. `q_cmd`는 이미 위치·속도·증분 제한을 통과했지만 실제 joint limits, 통신 watchdog, deadman, 충돌 감시, E-stop은 adapter/robot side에서 추가로 확인해야 한다.

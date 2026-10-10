@@ -1,14 +1,18 @@
 # Robot Teleoperation Framework
 
 Neuromeka Indy7 조작 및 task-space MPC 실험을 위한 ROS 2 저장소입니다.
+이 저장소의 공식 사용 경로는 Docker입니다. 호스트에는 Docker Engine 또는 Docker
+Desktop만 준비하면 되며, ROS 2·Python virtualenv·Crocoddyl은 이미지 안에 설치됩니다.
+
 현재 저장소에는 다음 범위가 들어 있습니다.
 
 - `indy7_mpc`: Indy7 URDF, Crocoddyl/Pinocchio 기반 SE(3) MPC, RViz 및 mock `ros2_control` 실행
 - `manipulator/indy7_mpc_test.py`: ROS 2와 분리된 최소 MPC 드라이런
-- `manipulator/requirements-crocoddyl.txt`: Python 기반 MPC 의존성
+- `docker/Dockerfile`: ROS 2 Jazzy 기반 실행·테스트 이미지 빌드 레시피
 
 실제 로봇에 명령을 보내는 IndyDCP3 adapter, deadman/E-stop, 충돌 감시는 포함되어 있지
-않습니다. 실기 배포 전에는 반드시 별도 하드웨어 경계를 추가해야 합니다.
+않습니다. 현재 Docker 실행은 mock hardware 시뮬레이션 검증용이며, 실기 배포 전에는
+별도 하드웨어 안전 경계를 추가해야 합니다.
 
 ## Directory layout
 
@@ -32,114 +36,125 @@ Neuromeka Indy7 조작 및 task-space MPC 실험을 위한 ROS 2 저장소입니
 └── README.md
 ```
 
-`build/`, `install/`, `log/`, `logs/`, `.venv/`는 로컬 생성물이라 Git에 넣지 않습니다.
-Docker 이미지도 Git에 넣지 않습니다. Git에는 이미지를 만드는 `docker/Dockerfile`과
-실행 초기화를 담당하는 `docker/entrypoint.sh`만 포함합니다.
+`build/`, `install/`, `log/`, `logs/`, `.venv/`는 생성물이며 Git에 넣지 않습니다.
+Docker 이미지도 GitHub에 업로드하지 않습니다. Git에는 이미지를 재현하는
+`docker/Dockerfile`과 컨테이너 초기화를 담당하는 `docker/entrypoint.sh`만 포함합니다.
 
 ## Requirements
 
-### Native setup
-
-- Ubuntu 환경의 ROS 2 Jazzy
-- Python 3.12 권장
-- `colcon`, `rosdep`, `python3-venv`
-- Crocoddyl, Pinocchio, NumPy 등은 `manipulator/requirements-crocoddyl.txt`로 설치
-
-### Docker setup
-
 - Docker Engine 또는 Docker Desktop
 - Docker BuildKit/buildx 권장
-- 호스트의 ROS 2, Python virtualenv, Crocoddyl 설치는 필요하지 않음
+- headless 실행은 Linux Docker host 기준으로 검증했습니다. Docker Desktop에서는 `--net=host` 지원 여부와 DDS 네트워크 설정을 확인해야 합니다.
+- RViz 같은 GUI를 사용할 때는 호스트 운영체제에 맞는 X11/Wayland 전달 설정이 추가로 필요합니다.
+
+호스트의 ROS 2, `rosdep`, `python3-venv`, Crocoddyl 설치는 필요하지 않습니다.
 
 ## Clone and build
 
 ```bash
-git clone <repository-url> RobotTeleoperationFramework
+git clone https://github.com/JHyoonirl/RobotTeleoperationFramework.git RobotTeleoperationFramework
 cd RobotTeleoperationFramework
 
-export ROS_DISTRO=${ROS_DISTRO:-jazzy}
-source "/opt/ros/$ROS_DISTRO/setup.bash"
-
-python3 -m venv --system-site-packages --copies .venv
-source .venv/bin/activate
-python3 -m pip install -r manipulator/requirements-crocoddyl.txt
-
-rosdep install --from-paths manipulator/ros2_ws/src --ignore-src -r -y
-make build
-source manipulator/ros2_ws/install/setup.bash
+make docker-build
 ```
 
-이미 정상적인 `.venv`가 있으면 virtualenv 생성 단계는 건너뛰면 됩니다. 다른 경로에서
-복사했거나 Python 실행 파일이 시스템 Python을 직접 가리키는 오래된 `.venv`는 삭제 후
-위 명령으로 다시 만드십시오. 이후에는 다음처럼 루트에서 반복 작업할 수 있습니다.
+같은 작업을 Docker 명령으로 직접 실행할 수도 있습니다.
 
 ```bash
-make build
-make test
-make list
+docker build -f docker/Dockerfile -t robot-teleoperation-framework .
+```
+
+이미지 빌드 단계에서 ROS 패키지를 컴파일하고 `indy7_mpc` 패키지 테스트까지 실행합니다.
+이미지는 ROS/RViz 및 Python 과학 계산 의존성을 포함하므로 로컬 Docker 저장소에서 수 GB가
+될 수 있습니다. 이 크기는 Git 저장소나 Dockerfile의 크기가 아닙니다.
+
+## Verify the image
+
+```bash
+make docker-test
+```
+
+또는 컨테이너 안에서 테스트 결과를 직접 확인합니다.
+
+```bash
+docker run --rm robot-teleoperation-framework \
+  python3 -m colcon test-result --verbose
+```
+
+ROS와 분리된 MPC 드라이런도 이미지 안에서 실행합니다.
+
+```bash
+docker run --rm robot-teleoperation-framework \
+  python3 indy7_mpc_test.py
+
+docker run --rm robot-teleoperation-framework \
+  python3 indy7_mpc_test.py \
+  --target '0.1,-0.2,0.3,0,0.2,-0.1'
 ```
 
 ## Run the simulation
 
-```bash
-source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
-source .venv/bin/activate
-source manipulator/ros2_ws/install/setup.bash
-ros2 launch indy7_mpc indy7_mpc.launch.py
-```
-
-GUI가 없는 환경에서는 다음처럼 RViz와 plot 창을 끌 수 있습니다.
+기본 명령은 GUI 없는 headless 시뮬레이션입니다.
 
 ```bash
-ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
-```
-
-세부 토픽, YAML 파라미터, 실기 adapter 경계는
-[`manipulator/ros2_ws/README.md`](manipulator/ros2_ws/README.md)를 참고합니다.
-
-## Direct smoke test
-
-```bash
-source .venv/bin/activate
-python manipulator/indy7_mpc_test.py
-```
-
-## Docker
-
-`docker/Dockerfile`은 저장소를 실행 가능한 Docker 이미지로 만드는 빌드 레시피입니다.
-이미지 자체는 GitHub에 업로드하지 않으며, 사용자가 clone한 뒤 각 환경에서 직접
-빌드합니다. Dockerfile은 ROS 2 Jazzy, `ros2_control` mock hardware,
-Crocoddyl/Pinocchio를 설치하고 이미지 빌드 중 패키지 테스트까지 실행합니다.
-
-기본 이미지는 GUI 없는 headless 시뮬레이션으로 실행됩니다.
-
-```bash
-make docker-build
-make docker-test
 make docker-run
 ```
 
-위 명령은 각각 이미지를 만들고, 이미지에 기록된 테스트 결과를 확인하고, ROS 2
-시뮬레이션을 실행합니다. 같은 작업을 Docker 명령으로 직접 실행할 수도 있습니다.
+직접 실행할 때는 다음과 같습니다. `--net=host`와 `--ipc=host`는 ROS 2 DDS 통신을
+호스트와 맞추기 위한 옵션입니다.
 
 ```bash
-docker build -f docker/Dockerfile -t robot-teleoperation-framework .
-docker run --rm --net=host --ipc=host robot-teleoperation-framework
+docker run --rm --net=host --ipc=host \
+  robot-teleoperation-framework
 ```
 
-`docker build`로 생성되는 이미지는 ROS/RViz 및 Python 과학 계산 의존성을 포함하므로
-로컬에서 수 GB가 될 수 있습니다. 이는 Git 저장소 크기나 Dockerfile 크기가 아니라
-Docker host에 저장되는 빌드 결과물입니다.
+실행 옵션을 바꾸려면 이미지의 기본 명령을 덮어씁니다.
 
-RViz나 실시간 plot을 사용하려면 X11/Wayland 전달 설정이 추가로 필요합니다. GUI를
-사용하지 않는 서버·CI 환경에서는 기본 headless 실행을 사용합니다.
+```bash
+docker run --rm --net=host --ipc=host \
+  robot-teleoperation-framework \
+  ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
+```
 
-실제 로봇 연결용 IndyDCP3 adapter, deadman/E-stop, 충돌 감시는 Dockerfile에도
-포함되어 있지 않습니다. 현재 Docker 실행은 mock hardware 시뮬레이션 검증용입니다.
+컨테이너를 백그라운드에서 유지하면서 토픽을 확인하려면 이름을 지정합니다.
+
+```bash
+docker run -d --name robot-teleoperation --net=host --ipc=host \
+  robot-teleoperation-framework
+
+docker logs -f robot-teleoperation
+```
+
+다른 터미널에서 컨테이너 내부의 ROS 명령을 실행할 수 있습니다.
+
+```bash
+docker exec robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && \
+   source /opt/robot_teleoperation_framework/install/setup.bash && \
+   ros2 topic list'
+```
+
+종료 후 컨테이너를 정리합니다.
+
+```bash
+docker rm -f robot-teleoperation
+```
+
+## Detailed documentation
+
+- [Indy7 MPC 시작점](manipulator/README.md)
+- [ROS 2 패키지, 토픽, 파라미터 및 실험 방법](manipulator/ros2_ws/README.md)
+
+## Hardware boundary
+
+실기 연결은 다음 단계에서 IndyDCP3 client를 사용하는 별도 adapter로 추가해야 합니다.
+adapter에는 최소한 joint/velocity/acceleration limit, 통신 watchdog, deadman, 충돌 감시,
+비상정지(E-stop)를 포함하고, `mpc/joint_position_cmd`를 실제 로봇에 전달하기 전에
+안전 검사를 수행해야 합니다.
 
 ## Release checklist
 
-1. `make build`와 `make test`가 새 환경에서 통과하는지 확인합니다.
-2. 실제 장비 연결 전 joint limit, velocity limit, watchdog, deadman, E-stop을 검증합니다.
-3. `ros2_ws/config`의 실험 파라미터와 실제 장비 설정을 분리해 관리합니다.
+1. `make docker-build`가 새 환경에서 성공하는지 확인합니다.
+2. `make docker-test`와 headless 시뮬레이션이 통과하는지 확인합니다.
+3. 실제 장비 연결 전 하드웨어 adapter의 limit, watchdog, deadman, E-stop을 검증합니다.
 4. 공개 배포 전 저장소의 최상위 라이선스를 프로젝트 정책에 맞게 결정합니다.

@@ -32,6 +32,7 @@ RUN python3 -m pip install --no-cache-dir --break-system-packages --ignore-insta
         "scipy>=1.14" \
     && rm /tmp/requirements-crocoddyl.txt
 
+COPY manipulator/indy7_mpc_test.py ./indy7_mpc_test.py
 COPY manipulator/ros2_ws/src ./src
 
 RUN source /opt/ros/jazzy/setup.bash \

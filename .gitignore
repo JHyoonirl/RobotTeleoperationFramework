@@ -24,6 +24,7 @@ __pycache__/
 # Local logs and runtime output
 *.log
 log.txt
+.docker-data/
 *.tmp
 *.bak
 
