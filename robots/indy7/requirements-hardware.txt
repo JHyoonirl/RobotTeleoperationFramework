@@ -1,0 +1,13 @@
+neuromeka==3.5.0.10
+certifi
+charset-normalizer>=2,<4
+grpcio==1.59.0
+grpcio-tools==1.59.0
+idna>=2.5,<4
+netifaces2
+numpy<=1.26.4
+Pillow>=10
+protobuf>=4.24.4,<=4.25.4
+pyModbusTCP==0.2.1
+requests>=2.31,<=2.32.0
+urllib3>=2.0.7,<=2.2.2

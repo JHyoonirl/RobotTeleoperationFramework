@@ -1,42 +1,51 @@
-# Indy7 MPC 시작점
+# Indy7 Runtime
 
-이 디렉터리의 실행·검증은 Docker 컨테이너 안에서 수행합니다. 호스트에서 Python
-virtualenv를 만들거나 ROS 2를 source할 필요가 없습니다.
+이 저장소는 Indy7 실행을 별도 ROS 2 컨테이너로 나눕니다.
 
-저장소 루트에서 이미지를 먼저 빌드합니다.
+- `robot-teleoperation-framework:mpc`: ROS Jazzy, NumPy 2, Pinocchio/Crocoddyl, mock simulation
+- `robot-teleoperation-framework:dcp3`: ROS Jazzy, NumPy 1, Neuromeka IndyDCP3 client
+- `robot-teleoperation-framework:mpc-gui`: optional RViz and joint-state GUI layer
+- `indy7_description`: 두 컨테이너가 공유하는 URDF와 mesh
+
+계산 런타임과 제조사 통신 SDK의 Python 의존성을 분리해 ABI 충돌을 막고, 실기 adapter를
+MPC 의존성 변경으로부터 격리합니다. RViz는 필요할 때만 별도 이미지로 추가합니다. 빌드와
+테스트는 저장소 루트에서 실행합니다.
 
 ```bash
-cd /path/to/RobotTeleoperationFramework
 make docker-build
+make docker-test
 ```
 
-`indy7_mpc_test.py`는 Neuromeka Indy7(6-DOF)의 관절 위치 추종을 위한 ROS 2와 분리된
-최소 MPC 드라이런입니다.
+## MPC Simulation
+
+컨테이너 셸을 연 뒤 mock hardware 시뮬레이션을 실행합니다.
 
 ```bash
-docker run --rm robot-teleoperation-framework \
-  python3 indy7_mpc_test.py
+make docker-run
 ```
-
-목표는 라디안 6개로 지정합니다.
 
 ```bash
-docker run --rm robot-teleoperation-framework \
-  python3 indy7_mpc_test.py \
-  --target '0.1,-0.2,0.3,0,0.2,-0.1'
+ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
 ```
 
-ROS 2 패키지의 mock hardware 시뮬레이션은 다음처럼 실행합니다.
+ROS 2와 분리된 MPC 드라이런은 다음처럼 실행할 수 있습니다.
 
 ```bash
-docker run --rm --net=host --ipc=host \
-  robot-teleoperation-framework
+docker run --rm robot-teleoperation-framework:mpc python3 indy7_mpc_test.py
+docker run --rm robot-teleoperation-framework:mpc \
+  python3 indy7_mpc_test.py --target '0.1,-0.2,0.3,0,0.2,-0.1'
 ```
 
-상세한 launch 옵션, 토픽, YAML 파라미터, 로그 분석, 실기 adapter 경계는
-[`ros2_ws/README.md`](../../ros2_ws/README.md)를 참고합니다.
+## Hardware
 
-실장 전에는 Indy7 드라이버에서 매 주기 `position`, `velocity`를 읽고
-`mpc/joint_position_cmd`를 IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()`로 전달해야
-합니다. 변환에는 실제 joint limit, 통신 watchdog, 충돌 감시, 비상정지, deadman 스위치가
-필요합니다.
+두 Indy 컨테이너를 ROS 2 네트워크에서 함께 시작합니다. 실제 제어기 주소를 지정해야
+합니다. 이 단계는 DCP3 상태 피드백을 읽고 MPC를 시작할 뿐, 로봇을 arm하거나 움직이지
+않습니다.
+
+```bash
+make docker-up-indy7 ROBOT_IP=controller-address
+```
+
+첫 이동 전 피드백과 현재 TCP pose를 확인하고, 물리 E-stop이 즉시 사용 가능한 상태에서
+명시적인 deadman과 arm 절차를 따라야 합니다. 상세 단계는
+[`indy7_dcp3 README`](../../ros2_ws/src/indy7_dcp3/README.md)에 있습니다.

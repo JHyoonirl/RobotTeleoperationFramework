@@ -10,10 +10,15 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     share = Path(get_package_share_directory("indy7_mpc"))
-    urdf = share / "urdf" / "indy7.urdf"
+    description_share = Path(get_package_share_directory("indy7_description"))
+    urdf = description_share / "urdf" / "indy7.urdf"
     controllers = share / "config" / "indy7_controllers.yaml"
     config_file = LaunchConfiguration("config_file")
     simulate = LaunchConfiguration("simulate")
+    initialize_target_from_current_state = LaunchConfiguration(
+        "initialize_target_from_current_state"
+    )
+    joint_state_gui = LaunchConfiguration("joint_state_gui")
     plot = LaunchConfiguration("plot")
     rviz = LaunchConfiguration("rviz")
     def mpc_node(*, condition, remappings):
@@ -21,7 +26,14 @@ def generate_launch_description():
             package="indy7_mpc",
             executable="crocoddyl_mpc_node",
             name="crocoddyl_mpc",
-            parameters=[config_file, {"urdf_path": str(urdf), "simulate": simulate}],
+            parameters=[
+                config_file,
+                {
+                    "urdf_path": str(urdf),
+                    "simulate": simulate,
+                    "initialize_target_from_current_state": initialize_target_from_current_state,
+                },
+            ],
             remappings=remappings,
             condition=condition,
             # Use the active venv's Python instead of an old shebang baked into
@@ -43,6 +55,16 @@ def generate_launch_description():
                 description="Start ros2_control position-command simulation",
             ),
             DeclareLaunchArgument(
+                "initialize_target_from_current_state",
+                default_value="false",
+                description="Seed the initial target from the first joint-state message",
+            ),
+            DeclareLaunchArgument(
+                "joint_state_gui",
+                default_value="false",
+                description="Publish manually edited joint states (do not use with a real driver)",
+            ),
+            DeclareLaunchArgument(
                 "plot",
                 default_value="true",
                 description="Open the live MPC matplotlib dashboard",
@@ -56,7 +78,7 @@ def generate_launch_description():
                 package="joint_state_publisher_gui",
                 executable="joint_state_publisher_gui",
                 name="joint_state_publisher_gui",
-                condition=UnlessCondition(simulate),
+                condition=IfCondition(joint_state_gui),
             ),
             Node(
                 package="robot_state_publisher",
@@ -115,8 +137,7 @@ def generate_launch_description():
                 name="mpc_plotter",
                 condition=IfCondition(plot),
                 parameters=[{"urdf_path": str(urdf)}],
-                # Matplotlib is provided by the system ROS Python environment.
-                prefix=["/usr/bin/python3"],
+                prefix=[FindExecutable(name="python3")],
                 output="screen",
             ),
         ]

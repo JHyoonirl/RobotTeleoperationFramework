@@ -1,9 +1,7 @@
 """Small Crocoddyl action model for pose-space teleoperation MPC.
 
-The pip Crocoddyl/Pinocchio combination used by this workspace has an
-unstable frame-residual derivative path.  This model keeps the same SE(3)
-objective, but evaluates the frame residual and its local Jacobian explicitly
-before handing the derivatives to Crocoddyl's FDDP solver.
+The frame residual and local Jacobian are evaluated explicitly before the
+derivatives are handed to Crocoddyl's FDDP solver.
 """
 
 from __future__ import annotations

@@ -1,0 +1,29 @@
+services:
+  mpc:
+    image: ${ROBOT_TELEOP_MPC_IMAGE:-robot-teleoperation-framework:mpc}
+    network_mode: host
+    ipc: host
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+    command:
+      - ros2
+      - launch
+      - indy7_mpc
+      - indy7_mpc.launch.py
+      - simulate:=false
+      - initialize_target_from_current_state:=true
+      - joint_state_gui:=false
+      - rviz:=false
+      - plot:=false
+
+  dcp3:
+    image: ${INDY7_DCP3_IMAGE:-robot-teleoperation-framework:dcp3}
+    network_mode: host
+    ipc: host
+    environment:
+      ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
+      INDY7_ROBOT_IP: ${INDY7_ROBOT_IP:?Set INDY7_ROBOT_IP to the Indy7 controller address}
+    command:
+      - bash
+      - -lc
+      - exec ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$$INDY7_ROBOT_IP

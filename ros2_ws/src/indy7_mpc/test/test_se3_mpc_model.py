@@ -5,12 +5,13 @@ from pathlib import Path
 import crocoddyl
 import numpy as np
 import pinocchio as pin
+from ament_index_python.packages import get_package_share_directory
 
 from indy7_mpc.se3_dynamic_model import SE3DynamicActionModel
 
 
 def test_zero_pose_error_has_zero_tracking_cost():
-    urdf = Path(__file__).parents[1] / "urdf" / "indy7.urdf"
+    urdf = Path(get_package_share_directory("indy7_description")) / "urdf" / "indy7.urdf"
     model = pin.buildModelFromUrdf(str(urdf))
     state = crocoddyl.StateMultibody(model)
     q = np.array([0.0, 0.0, -1.57, 0.0, -1.57, 0.0])

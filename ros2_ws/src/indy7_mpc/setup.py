@@ -1,11 +1,8 @@
 from glob import glob
-from pathlib import Path
-
 from setuptools import setup
 
 
 package_name = "indy7_mpc"
-mesh_root = Path("meshes/indy7")
 
 setup(
     name=package_name,
@@ -14,12 +11,8 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", [f"resource/{package_name}"]),
         (f"share/{package_name}", ["package.xml"]),
-        (f"share/{package_name}", ["THIRD_PARTY_NOTICE.md"]),
-        (f"share/{package_name}/urdf", glob("urdf/*")),
-        (f"share/{package_name}/launch", glob("launch/*")),
-        (f"share/{package_name}/config", glob("config/*")),
-        (f"share/{package_name}/meshes/indy7/visual", glob(str(mesh_root / "visual/*"))),
-        (f"share/{package_name}/meshes/indy7/collision", glob(str(mesh_root / "collision/*"))),
+        (f"share/{package_name}/launch", glob("launch/*.py")),
+        (f"share/{package_name}/config", glob("config/*.yaml")),
     ],
     install_requires=["setuptools"],
     extras_require={"test": ["pytest"]},

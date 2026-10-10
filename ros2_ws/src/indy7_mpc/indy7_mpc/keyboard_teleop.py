@@ -62,6 +62,8 @@ class KeyboardTeleop(Node):
         self.declare_parameter("topic", "/teleop/target_pose")
         self.declare_parameter("frame_id", "world")
         self.declare_parameter("rate", 30.0)
+        self.declare_parameter("initialize_from_current_pose", False)
+        self.declare_parameter("current_pose_topic", "/mpc/current_pose")
         self.declare_parameter("translation_step", 0.01)
         self.declare_parameter("rotation_step_deg", 5.0)
         self.declare_parameter(
@@ -93,14 +95,34 @@ class KeyboardTeleop(Node):
         if self.rate <= 0.0 or self.translation_step <= 0.0 or self.rotation_step <= 0.0:
             raise ValueError("rate, translation_step, rotation_step은 양수여야 합니다.")
 
+        self.initialize_from_current_pose = self._as_bool(
+            self.get_parameter("initialize_from_current_pose").value
+        )
+        self.current_pose_topic = str(self.get_parameter("current_pose_topic").value)
+        self.pose_initialized = not self.initialize_from_current_pose
+        self.home_position = self.position.copy()
+        self.home_orientation = self.orientation.copy()
+
         self.publisher = self.create_publisher(PoseStamped, self.topic, 10)
+        self.current_pose_sub = None
+        if self.initialize_from_current_pose:
+            if not self.current_pose_topic:
+                raise ValueError("current_pose_topic cannot be empty")
+            self.current_pose_sub = self.create_subscription(
+                PoseStamped, self.current_pose_topic, self._on_current_pose, 1
+            )
         self.timer = self.create_timer(1.0 / self.rate, self._tick)
         self._terminal_settings = None
         if not sys.stdin.isatty():
             raise RuntimeError("키보드 teleop은 터미널에서 실행해야 합니다.")
         self._terminal_settings = termios.tcgetattr(sys.stdin)
         tty.setcbreak(sys.stdin.fileno())
-        self._publish()
+        if self.pose_initialized:
+            self._publish()
+        else:
+            self.get_logger().info(
+                f"Waiting for the measured TCP pose on {self.current_pose_topic}; no target published yet."
+            )
         self.get_logger().info(
             "Keyboard teleop: w/s=x, a/d=y, r/f=z | "
             "u/o=roll, i/k=pitch, j/l=yaw | space=reset, q=quit"
@@ -113,23 +135,46 @@ class KeyboardTeleop(Node):
             self._terminal_settings = None
             print()
 
+    @staticmethod
+    def _as_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    def _on_current_pose(self, message: PoseStamped) -> None:
+        pose = message.pose
+        position = [pose.position.x, pose.position.y, pose.position.z]
+        orientation = [
+            pose.orientation.x,
+            pose.orientation.y,
+            pose.orientation.z,
+            pose.orientation.w,
+        ]
+        if not all(math.isfinite(value) for value in position + orientation):
+            return
+        try:
+            orientation = _normalize(orientation)
+        except ValueError:
+            return
+        self.position = position
+        self.orientation = orientation
+        self.home_position = position.copy()
+        self.home_orientation = orientation.copy()
+        self.pose_initialized = True
+        self._publish()
+        self.get_logger().info("Keyboard target synchronized to measured TCP pose.")
+
     def _tick(self) -> None:
         while select.select([sys.stdin], [], [], 0.0)[0]:
             key = sys.stdin.read(1).lower()
             if key == "q":
                 rclpy.shutdown()
                 return
+            if not self.pose_initialized:
+                continue
             if key == " ":
-                self.position = _vector(
-                    self.get_parameter("initial_position").value, 3, "initial_position"
-                )
-                self.orientation = _normalize(
-                    _vector(
-                        self.get_parameter("initial_orientation_xyzw").value,
-                        4,
-                        "initial_orientation_xyzw",
-                    )
-                )
+                self.position = self.home_position.copy()
+                self.orientation = self.home_orientation.copy()
             elif key in {"w", "s", "a", "d", "r", "f"}:
                 axis = {"w": (0, 1), "s": (0, -1), "a": (1, 1), "d": (1, -1), "r": (2, 1), "f": (2, -1)}[key]
                 self.position[axis[0]] += axis[1] * self.translation_step

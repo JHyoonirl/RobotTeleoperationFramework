@@ -1,11 +1,12 @@
-# Neuromeka Indy7 + ROS2 + Crocoddyl
+# Neuromeka Indy7 + ROS 2 + Crocoddyl
 
 공식 `neuromeka-robotics/indy-ros2`에서 Indy7에 필요한 것만 가져왔다.
 
-- 공식 생성 URDF: `src/indy7_mpc/urdf/indy7.urdf`
+- 공용 로봇 모델 package: `src/indy7_description` (URDF와 visual/collision STL)
 - Indy7 링크의 visual/collision STL 14개
-- ROS2 description/시각화와 Crocoddyl MPC를 합친 단일 최소 패키지
+- ROS 2 모델, MPC 계산, 실기 통신을 독립 package로 분리
 - `indy_driver`, `indy_gazebo`, `indy_moveit`, `indy_interfaces`는 복사하지 않음
+- `indy7_dcp3`: Neuromeka Python DCP3 client를 쓰는 제한된 실기 adapter
 
 Indy7은 제품명이 7이지만 실제 관절은 6개다. 기본 MPC 상태는
 `x=[q, qdot]`, 내부 최적화 입력은 URDF effort limit 안의 관절 토크 `u=tau`다.
@@ -18,8 +19,19 @@ IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()` adapter에 연결한다.
 ## Docker 실행환경
 
 이 문서의 모든 ROS 2 명령은 Docker 컨테이너 안에서 실행한다. 호스트에서 ROS 2를
-설치하거나 `.venv`를 만들거나 `rosdep`를 실행하지 않는다. 의존성 설치, colcon build,
-패키지 테스트는 저장소 루트의 `docker/Dockerfile`에 고정되어 있다.
+설치하거나 `.venv`를 만들거나 `rosdep`를 실행하지 않는다. MPC image는
+[`requirements-mpc.txt`](../robots/indy7/requirements-mpc.txt)의 NumPy 2 / Pinocchio /
+Crocoddyl Python stack을 사용한다. IndyDCP3 image는
+[`requirements-hardware.txt`](../robots/indy7/requirements-hardware.txt)의 Neuromeka SDK와
+NumPy 1 계열을 사용한다. Python ABI 충돌 방지를 위해 두 실행환경을 별도 이미지로 유지한다.
+
+IndyDCP3 통신 image에는 mock simulation과 시각화 의존성을 넣지 않는다. MPC image의 ROS
+패키지는 mock 시뮬레이션용 `ros2_control`, `controller_manager`,
+`joint_state_broadcaster`, `position_controllers`, `robot_state_publisher`를 설치한다.
+`rviz2`와 `joint_state_publisher_gui`는 선택형 `mpc-gui` 이미지에만 포함된다.
+이 구성은 공식 `indy_driver` ROS 패키지를 실행하지 않으므로
+MoveIt, Gazebo, RealSense, `joint_trajectory_controller`는 설치하지 않는다. 공식
+드라이버 전체를 별도로 사용할 때만 해당 README의 나머지 의존성이 필요하다.
 
 저장소 루트에서 이미지를 빌드하고 테스트한다.
 
@@ -29,6 +41,9 @@ make docker-build
 make docker-test
 ```
 
+두 이미지의 태그는 `robot-teleoperation-framework:mpc`와
+`robot-teleoperation-framework:dcp3`다. `make docker-run`은 MPC 컨테이너 셸을 연다.
+
 이미지 안에는 다음 경로로 빌드된 ROS 2 workspace가 있다.
 
 ```text
@@ -36,14 +51,13 @@ make docker-test
 /opt/robot_teleoperation_framework/install
 ```
 
-기본 이미지 이름은 `robot-teleoperation-framework`이며, 다른 이름을 사용하면 이후
-명령의 이미지 이름도 동일하게 바꾼다.
+이미지는 계산(MPC)과 제조사 통신(DCP3) 역할에 따라 분리되어 있다.
 
 ## 실행
 
 ```bash
 docker run --rm --net=host --ipc=host \
-  robot-teleoperation-framework
+  robot-teleoperation-framework:mpc
 ```
 
 위 명령은 이미지에 정의된 headless 기본 launch를 실행한다. launch 인자를 바꾸려면
@@ -51,7 +65,7 @@ docker run --rm --net=host --ipc=host \
 
 ```bash
 docker run --rm --net=host --ipc=host \
-  robot-teleoperation-framework \
+  robot-teleoperation-framework:mpc \
   ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
 ```
 
@@ -59,7 +73,7 @@ docker run --rm --net=host --ipc=host \
 
 ```bash
 docker run -d --name robot-teleoperation --net=host --ipc=host \
-  robot-teleoperation-framework
+  robot-teleoperation-framework:mpc
 docker logs -f robot-teleoperation
 ```
 
@@ -97,7 +111,7 @@ singular value/condition number, 월드 Z 회전에 필요한 추정 qdot, teleo
 mkdir -p .docker-data/logs
 docker run -d --name robot-teleoperation --net=host --ipc=host \
   -v "$PWD/.docker-data/logs:/opt/robot_teleoperation_framework/logs" \
-  robot-teleoperation-framework
+  robot-teleoperation-framework:mpc
 ```
 
 토픽은 다음과 같다.
@@ -205,7 +219,7 @@ cp ros2_ws/src/indy7_mpc/config/indy7_mpc.yaml \
 # my_experiment.yaml의 goal_position/goal_orientation_xyzw와 가중치를 수정
 docker run --rm --net=host --ipc=host \
   -v "$PWD/.docker-data/my_experiment.yaml:/tmp/my_experiment.yaml:ro" \
-  robot-teleoperation-framework \
+  robot-teleoperation-framework:mpc \
   ros2 launch indy7_mpc indy7_mpc.launch.py \
   config_file:=/tmp/my_experiment.yaml
 ```
@@ -255,7 +269,7 @@ goal 근처에서 떨리면 `velocity_cost_weight`, `torque_cost_weight`,
 
 ```bash
 docker run --rm --net=host --ipc=host \
-  robot-teleoperation-framework \
+  robot-teleoperation-framework:mpc \
   ros2 launch indy7_mpc indy7_mpc.launch.py \
   simulate:=false rviz:=false plot:=false
 ```
@@ -270,4 +284,68 @@ docker exec robot-teleoperation bash -lc \
    "{header: {frame_id: world}, pose: {position: {x: 0.55, y: -0.03, z: 0.50}, orientation: {x: -0.02, y: 0.99, z: 0.12, w: 0.10}}}"'
 ```
 
-실기 연결은 다음 단계에서 IndyDCP3 client를 사용하는 별도 adapter를 붙인다. adapter는 `mpc/joint_position_cmd`를 구독해 `TELE_JOINT_ABSOLUTE` 모드의 `movetelej_abs()`로 전달한다. `q_cmd`는 이미 위치·속도·증분 제한을 통과했지만 실제 joint limits, 통신 watchdog, deadman, 충돌 감시, E-stop은 adapter/robot side에서 추가로 확인해야 한다.
+## Indy7 실기 teleoperation
+
+계산과 하드웨어 연결은 별도 컨테이너다. MPC는 NumPy 2 / Crocoddyl을, DCP3 adapter는
+Neuromeka SDK와 NumPy 1을 사용하므로 같은 Python 환경에 설치하지 않는다.
+
+```bash
+make docker-build
+make docker-test
+```
+
+실제 제어기 IP로 두 서비스를 시작한다. 아래 문자열을 장비의 실제 주소로 바꾼다.
+
+```bash
+make docker-up-indy7 ROBOT_IP=controller-address
+```
+
+Compose는 `dcp3` adapter와 `simulate:=false`인 MPC를 시작한다. MPC는 첫 실측 joint state의
+TCP pose를 목표로 초기화한다. 시작만으로 로봇을 arm하거나 움직이지 않는다. 다른 터미널에서
+먼저 피드백과 pose를 확인한다.
+
+```bash
+docker compose -f docker/compose.indy7.yaml exec dcp3 \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /joint_states --once'
+docker compose -f docker/compose.indy7.yaml exec mpc \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /mpc/current_pose --once'
+```
+
+키보드 입력을 현재 TCP 자세에 동기화해 별도 터미널에서 실행한다. 첫 publish가 현재 자세와
+일치하므로 기본 예제 pose로의 초기 점프를 피한다.
+
+```bash
+docker compose -f docker/compose.indy7.yaml exec mpc \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true'
+```
+
+deadman을 지속 발행하는 터미널을 별도로 열어 둔다. Ctrl+C로 발행이 끊기면 0.3초 후
+adapter가 teleop을 정지하고 disarm한다.
+
+```bash
+docker compose -f docker/compose.indy7.yaml exec dcp3 \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic pub -r 10 /indy7_dcp3/deadman std_msgs/msg/Bool "{data: true}"'
+```
+
+피드백·목표·deadman을 확인하고 작업공간을 비운 뒤, 물리 E-stop에 바로 접근할 수 있을 때만
+arm 서비스를 호출한다.
+
+```bash
+docker compose -f docker/compose.indy7.yaml exec dcp3 \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: true}"'
+```
+
+정지는 `data: false`를 호출하거나 deadman 발행을 끊는다. adapter는 기본적으로 관절별
+setpoint 변화를 발행 주기 기준 0.05 rad/s에 해당하는 양으로 제한하고 URDF soft limit
+margin 0.05 rad를 적용한다. DCP3는 IDLE일 때만 arm된다. 이 setpoint 제한은 안전 정격
+속도 감시를 의미하지 않는다.
+소프트웨어 정지는 비상정지를 대신하지 않는다. 물리 E-stop을 즉시 누를 수 있게 하고,
+충돌 감시/작업공간 감시는 별도 기능으로 남아 있다.
+
+```bash
+docker compose -f docker/compose.indy7.yaml exec dcp3 \
+  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"'
+```
+
+두 컨테이너는 `make docker-down-indy7`로 종료한다. 안전 제한 및 watchdog은 안전 정격이
+아니며, 물리 E-stop과 제조사 commissioning 절차를 대체하지 않는다.

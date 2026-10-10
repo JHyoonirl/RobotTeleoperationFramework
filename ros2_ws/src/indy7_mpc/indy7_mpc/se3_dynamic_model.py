@@ -1,9 +1,7 @@
 """URDF-backed rigid-body action model for the Indy7 MPC.
 
-The public command boundary remains joint position, but the Crocoddyl
-prediction uses Pinocchio's articulated-body algorithm internally.  Keeping
-this model Python-backed avoids the Pinocchio/Crocoddyl binary-version
-coupling in the prebuilt wheel while retaining exact ABA derivatives.
+The public command boundary remains joint position, while the Crocoddyl
+prediction uses Pinocchio's articulated-body algorithm internally.
 """
 
 from __future__ import annotations

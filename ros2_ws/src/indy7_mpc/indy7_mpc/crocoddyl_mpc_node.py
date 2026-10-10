@@ -47,6 +47,7 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("dt", 0.02)
         self.declare_parameter("max_solver_iterations", 10)
         self.declare_parameter("simulate", False)
+        self.declare_parameter("initialize_target_from_current_state", False)
         # Keep a deterministic local plant only for standalone smoke tests.
         # Normal simulation uses ros2_control and its joint_states topic.
         self.declare_parameter("internal_simulation", False)
@@ -95,7 +96,8 @@ class CrocoddylMPCNode(Node):
             import pinocchio as pin
         except ImportError as exc:
             raise RuntimeError(
-                "Crocoddyl/Pinocchio가 없습니다. requirements-crocoddyl.txt를 설치하세요."
+                "Crocoddyl/Pinocchio가 없습니다. ROS Jazzy 패키지를 설치하세요: "
+                "ros-jazzy-crocoddyl ros-jazzy-pinocchio"
             ) from exc
 
         urdf_path = Path(str(self.get_parameter("urdf_path").value))
@@ -220,6 +222,10 @@ class CrocoddylMPCNode(Node):
         self.internal_simulation = self._as_bool(
             self.get_parameter("internal_simulation").value
         )
+        self.initialize_target_from_current_state = self._as_bool(
+            self.get_parameter("initialize_target_from_current_state").value
+        )
+        self.initial_target_state_initialized = not self.initialize_target_from_current_state
         cost_weights = (
             self.se3_position_cost_weight,
             self.se3_orientation_cost_weight,
@@ -444,6 +450,7 @@ class CrocoddylMPCNode(Node):
                 "dt",
                 "max_solver_iterations",
                 "simulate",
+                "initialize_target_from_current_state",
                 "internal_simulation",
                 "command_velocity_limits",
                 "command_increment_limits",
@@ -1040,6 +1047,25 @@ class CrocoddylMPCNode(Node):
             float(message.header.stamp.sec)
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
+        if not self.initial_target_state_initialized:
+            current_pose = self._tcp_pose(position).copy()
+            self.target_pose = current_pose
+            self.previous_target_pose = current_pose.copy()
+            self.cartesian_path_start_pose = current_pose.copy()
+            self.cartesian_path_start_time = time.monotonic()
+            self.cartesian_path_duration = self.cartesian_min_duration
+            self.cartesian_path_progress = 0.0
+            self.cartesian_path_initialized_from_state = True
+            self.cartesian_reference_poses = [
+                current_pose.copy() for _ in range(self.horizon + 1)
+            ]
+            self.xref = np.r_[position, np.zeros(self.model.nv)]
+            self.xs = [self.xref.copy() for _ in range(self.horizon + 1)]
+            self.us = [np.zeros(self.model.nv) for _ in range(self.horizon)]
+            self.initial_target_state_initialized = True
+            self.get_logger().info(
+                "Initial task target set to measured Indy7 TCP pose; waiting for teleop input."
+            )
 
     def _solver_is_numerically_stationary(self) -> bool:
         """Recognize FDDP's false negative at a zero-step optimum."""

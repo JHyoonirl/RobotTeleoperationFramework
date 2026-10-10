@@ -1,4 +1,5 @@
 .git
+**/.git
 .venv
 **/.venv
 **/__pycache__
@@ -12,4 +13,6 @@
 .vscode
 *.swp
 *.swo
-
+# The licensed Hand SDK is only sent through the opt-in named build context.
+.docker-data
+ros2_ws/src/hand_retargetting/
