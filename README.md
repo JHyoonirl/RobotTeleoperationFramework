@@ -89,6 +89,26 @@ source .venv/bin/activate
 python manipulator/indy7_mpc_test.py
 ```
 
+## Docker
+
+Docker는 ROS 2 Jazzy, `ros2_control` mock hardware, Crocoddyl/Pinocchio와
+패키지 테스트를 이미지 빌드 단계에서 함께 설치·검증합니다. 기본 실행은 GUI 없는
+시뮬레이션입니다.
+
+```bash
+docker build -f docker/Dockerfile -t robot-teleoperation-framework .
+docker run --rm --net=host --ipc=host robot-teleoperation-framework
+```
+
+빌드된 이미지의 테스트 결과만 다시 확인하려면 다음을 실행합니다.
+
+```bash
+make docker-test
+```
+
+RViz나 실시간 plot을 사용할 때는 X11/Wayland 전달이 필요하므로, headless 기본값을
+유지한 채 필요한 경우 launch 인자를 직접 덮어씁니다.
+
 ## Release checklist
 
 1. `make build`와 `make test`가 새 환경에서 통과하는지 확인합니다.
