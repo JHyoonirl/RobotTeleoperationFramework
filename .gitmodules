@@ -1,3 +1,6 @@
-[submodule "manipulator/ros2_ws/src/vive_tracker_ros2"]
-	path = manipulator/ros2_ws/src/vive_tracker_ros2
+[submodule "ros2_ws/src/vive_tracker_ros2"]
+	path = ros2_ws/src/vive_tracker_ros2
 	url = https://github.com/JHyoonirl/vive_tracker_ros2.git
+[submodule "ros2_ws/src/hand_retargetting"]
+	path = ros2_ws/src/hand_retargetting
+	url = https://github.com/JHyoonirl/Hand_retargetting.git

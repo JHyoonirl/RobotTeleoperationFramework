@@ -34,7 +34,7 @@ docker run --rm --net=host --ipc=host \
 ```
 
 상세한 launch 옵션, 토픽, YAML 파라미터, 로그 분석, 실기 adapter 경계는
-[`ros2_ws/README.md`](ros2_ws/README.md)를 참고합니다.
+[`ros2_ws/README.md`](../../ros2_ws/README.md)를 참고합니다.
 
 실장 전에는 Indy7 드라이버에서 매 주기 `position`, `velocity`를 읽고
 `mpc/joint_position_cmd`를 IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()`로 전달해야

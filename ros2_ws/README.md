@@ -200,7 +200,7 @@ docker exec robot-teleoperation bash -lc \
 
 ```bash
 mkdir -p .docker-data
-cp manipulator/ros2_ws/src/indy7_mpc/config/indy7_mpc.yaml \
+cp ros2_ws/src/indy7_mpc/config/indy7_mpc.yaml \
   .docker-data/my_experiment.yaml
 # my_experiment.yaml의 goal_position/goal_orientation_xyzw와 가중치를 수정
 docker run --rm --net=host --ipc=host \
