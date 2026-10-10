@@ -1,0 +1,32 @@
+# ROS 2 / colcon generated output
+**/build/
+**/install/
+**/log/
+**/logs/
+
+# Python generated files and local environments
+.venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+**/*.egg-info/
+.pytest_cache/
+**/.pytest_cache/
+
+# Local tools and editor state
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local logs and runtime output
+*.log
+log.txt
+*.tmp
+*.bak
+
+# OS metadata
+.DS_Store
+Thumbs.db
