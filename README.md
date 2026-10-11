@@ -26,6 +26,7 @@ IndyDCP3 연결에는 명시적 arm 서비스, deadman/명령 timeout, URDF 관�
 ├── docker/
 │   ├── Dockerfile
 │   ├── compose.indy7.yaml
+│   ├── dev-shell.sh
 │   └── entrypoint.sh
 ├── Makefile
 ├── robots/
@@ -56,8 +57,7 @@ Docker 이미지도 GitHub에 업로드하지 않습니다. Git에는 이미지�
 
 - Docker Engine 또는 Docker Desktop
 - Docker BuildKit/buildx와 Compose plugin
-- headless 실행은 Linux Docker host 기준으로 검증했습니다. Docker Desktop에서는 `--net=host` 지원 여부와 DDS 네트워크 설정을 확인해야 합니다.
-- RViz 같은 GUI를 사용할 때는 호스트 운영체제에 맞는 X11/Wayland 전달 설정이 추가로 필요합니다.
+- 실기 Indy7 개발 실행은 Linux 데스크톱의 X11/XWayland 세션이 필요합니다. Docker Desktop에서는 `--net=host`, DDS, GUI 전달이 다를 수 있습니다.
 
 호스트에 ROS 2나 Python MPC 의존성을 설치할 필요가 없습니다. MPC는 NumPy 2 계열의
 Pinocchio/Crocoddyl 환경이고, DCP3는 Neuromeka SDK가 요구하는 NumPy 1 계열 환경입니다.
@@ -80,8 +80,7 @@ make docker-build INCLUDE_HAND=1
 `robot-teleoperation-framework:dcp3`를 빌드합니다. `INCLUDE_HAND=1`을 추가하면
 Hand 저장소의 전용 Dockerfile도 사용해 Hand 이미지를 별도로 빌드합니다.
 Indy MPC와 DCP3 이미지는 `docker/compose.indy7.yaml`에서 ROS 2 네트워크로 연결됩니다.
-RViz와 joint-state GUI는 선택형 `mpc-gui` 이미지에만 포함되며 `make docker-run-gui`가
-필요할 때 빌드합니다.
+RViz가 포함된 `mpc-gui` 이미지가 없으면 `make docker-up-indy7` 실행 시 자동으로 빌드됩니다.
 
 이미지를 직접 빌드할 수도 있습니다.
 
@@ -116,26 +115,42 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-build-hand` | MANUS-WUJI Hand 이미지 하나만 빌드합니다. Indy 이미지는 빌드하지 않습니다. |
 | `make docker-build-gui` | RViz 실행에 필요한 별도 `mpc-gui` 이미지를 빌드합니다. |
 | `make docker-test` | 이미 빌드된 MPC와 DCP3 이미지의 colcon 테스트 결과를 표시합니다. |
-| `make docker-run` | 저장소를 `/workspace`로 마운트하고 workspace를 빌드한 뒤, MPC를 자동 실행하지 않고 셸을 엽니다. |
-| `make docker-run-gui` | `mpc-gui` 이미지를 빌드하고 RViz를 켠 MPC 시뮬레이션을 실행합니다. Linux GUI 환경이 필요합니다. |
+| `make docker-run` | 저장소 소스를 마운트하고 source overlay를 준비해 셸을 엽니다. ROS launch는 직접 실행합니다. |
+| `make docker-run-gui` | GUI 지원 이미지가 없을 때만 빌드하고, 마운트된 source overlay로 셸을 엽니다. |
 | `make docker-up-hand` | MANUS USB 장치를 확인하고 Hand 컨테이너에서 MANUS publisher만 백그라운드로 시작합니다. |
 | `make docker-down-hand` | Hand Compose 컨테이너를 종료하고 정리합니다. |
 | `make docker-check-indy7 ROBOT_IP=<주소>` | DCP3 연결/feedback 확인용 컨테이너만 실행합니다. MPC는 시작하지 않습니다. |
-| `make docker-up-indy7 ROBOT_IP=<주소>` | MPC와 DCP3 컨테이너를 연결해 실행합니다. 이미지가 미리 빌드되어 있어야 합니다. |
+| `make docker-up-indy7 ROBOT_IP=<주소>` | GUI 지원 MPC/DCP3 개발 컨테이너만 백그라운드로 준비합니다. ROS 노드는 자동 실행하지 않습니다. |
+| `make docker-shell-indy7 ROBOT_IP=<주소> INDY7_SERVICE=<service>` | `INDY7_SERVICE`를 `mpc` 또는 `dcp3`로 지정해 해당 컨테이너 shell에 들어갑니다. |
 | `make docker-down-indy7` | Indy7 Compose 컨테이너를 종료하고 정리합니다. |
 
-기본 MPC 시뮬레이션은 다음 순서입니다. `docker-run`은 셸만 열기 때문에 launch는 직접
-실행합니다. 셸을 나가면 해당 컨테이너도 제거됩니다.
+컨테이너에는 저장소가 `/workspace`로 마운트되고, MPC 패키지는 이 마운트된 소스에서
+`--symlink-install`로 실행됩니다. 첫 진입 때만 colcon overlay를 `.docker-data/indy7-mpc`에
+준비합니다. 이후 Python, launch, RViz config 등의 수정은 이미지 재빌드 없이 반영됩니다.
+새 파일이나 `package.xml`/`setup.py` 같은 패키지 구성 변경으로 다시 빌드해야 할 때는
+`make docker-run-gui FORCE_COLCON_BUILD=1`을 사용하세요. `docker-build-gui`는 GUI/시스템
+의존성이나 Dockerfile 변경 시 이미지 자체를 갱신할 때 사용합니다. 기본 MPC 시뮬레이션은
+셸에서 직접 launch하며 `simulate`의 기본값은 `true`입니다. 소스 편집은 실행 중인 Python
+프로세스에 hot reload되지 않으므로, 수정한 노드나 launch를 재시작하면 변경이 적용됩니다.
 
 ```bash
-make docker-build
-make docker-run
+make docker-run-gui
 # 컨테이너 셸에서
-ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
+ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true rviz:=true plot:=true \
+  diagnostic_log_directory:=/tmp/indy7_sim_logs
 ```
 
-RViz 시뮬레이션은 `make docker-run-gui`로 시작하며, 이 명령은 이미지를 준비한 뒤 launch를
-바로 실행합니다. 종료할 때는 실행 중인 터미널에서 `Ctrl+C`를 누릅니다.
+별도 터미널에서 launch가 실행 중일 때 시뮬레이터와 MPC 출력도 확인할 수 있습니다.
+
+```bash
+docker exec -it robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && ros2 topic echo /joint_states --once'
+docker exec -it robot-teleoperation bash -lc \
+  'source /opt/ros/jazzy/setup.bash && ros2 topic echo /forward_position_controller/commands --once'
+```
+
+두 토픽에 6관절 데이터가 나오면 simulation state와 MPC command 경로가 동작 중입니다.
+launch는 `Ctrl+C`로 종료합니다.
 
 MANUS-WUJI는 독립 이미지와 컨테이너를 사용합니다. 다음 명령은 Hand 이미지와 MANUS
 publisher를 준비하지만, WUJI 드라이버와 retargeting launch는 자동으로 시작하지 않습니다.
@@ -159,43 +174,76 @@ docker exec -it manus-retargetting bash -lc \
 ```
 
 Hand 컨테이너 로그는 `docker logs -f manus-retargetting`로 확인합니다. 종료는
-`make docker-down-hand`입니다. MANUS와 WUJI가 같은 ROS domain/network를 사용해야 하며,
+`make docker-down-hand`입니다. Indy MPC/DCP3와 MANUS/WUJI 컨테이너는 모두 `ROS_DOMAIN_ID=77`을
+사용합니다. 호스트에서 ROS 노드를 직접 실행할 때도 `export ROS_DOMAIN_ID=77`을 설정해야 하며,
 실제 손 구동 전 드라이버와 장치 상태를 확인하십시오.
 
-로봇 연결만 확인할 때는 MPC를 띄우지 않고 DCP3 feedback만 읽습니다. DCP3 이미지가
-없다면 먼저 단독 빌드한 다음, 첫 번째 터미널에서 연결 점검을 시작합니다.
+연결만 빠르게 확인할 때는 이 one-shot 명령을 쓸 수 있습니다. 정상 개발 흐름에서는 아래처럼
+idle 컨테이너에 들어가 각 노드를 직접 실행합니다.
 
 ```bash
 make docker-build-dcp3
 make docker-check-indy7 ROBOT_IP=192.168.0.10
 ```
 
-로그에 DCP3 client 시작 메시지가 나온 뒤 두 번째 터미널에서 실제 joint feedback을
-읽습니다. `/joint_states`에 6개 관절의 이름과 위치가 한 번 출력되면 DCP3 통신 및 ROS
-feedback 경로가 확인된 것입니다. 이 점검은 DCP3 컨트롤러의 상태만 읽으며, MPC를 실행하지
-않고 teleop arm도 하지 않습니다.
+일반 개발 세션은 컨테이너만 시작합니다. 어떤 ROS 노드도 자동 launch하지 않습니다.
+MPC/DCP3 소스는 `/workspace`에서 직접 마운트하며, 각각의 symlink overlay는
+`.docker-data/indy7-mpc`, `.docker-data/dcp3`에 보존됩니다. 일반 코드 수정은 이미지 빌드가
+필요 없고, 패키지 구성 변경 뒤에는 해당 셸을 강제 재빌드로 다시 엽니다.
 
 ```bash
-INDY7_ROBOT_IP=192.168.0.110 docker compose -f docker/compose.indy7.yaml exec dcp3 bash -lc \
-  'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /joint_states --once'
+make docker-up-indy7 ROBOT_IP=192.168.0.110
 ```
 
-연결 점검을 마치려면 첫 번째 터미널에서 `Ctrl+C`를 누릅니다. DCP3 feedback 오류가
-반복되거나 토픽이 나오지 않으면 컨테이너 로그의 연결 오류와 제어기 IP/network 설정을
-확인하십시오. 이 연결 점검 컨테이너를 전체 Indy teleop과 동시에 실행하지 마세요.
-
-MPC와 함께 Indy7 실기 컨테이너를 시작하려면 다음 명령을 사용합니다. 이것도 로봇을
-자동 arm하거나 움직이지 않습니다. 실기 구동과 arm 절차 및 안전 주의사항은 아래
-[Hardware boundary](#hardware-boundary)를 따르십시오.
+터미널 1에서 DCP3 shell을 열고 드라이버를 launch합니다. ROS와 마운트된 source overlay는
+진입 시 자동으로 source됩니다.
 
 ```bash
-make docker-build
-make docker-up-indy7 ROBOT_IP=192.168.0.10
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+# 첫 진입 때 overlay를 만들고, 소스 수정은 해당 노드를 재시작하면 반영됩니다.
+ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$INDY7_ROBOT_IP
 ```
 
-Compose 로그가 표시되는 터미널에서 `Ctrl+C`를 누르거나 다른 터미널에서
-`make docker-down-indy7`을 실행해 종료합니다. `ROBOT_IP`는 실제 Indy7 제어기 주소로
-바꿉니다.
+터미널 2에서 MPC launch를 실행합니다. 이 launch가 RViz와 MPC plot을 띄웁니다.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
+ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=false \
+  initialize_target_from_current_state:=true rviz:=true plot:=true \
+  diagnostic_log_directory:=/tmp/indy7_mpc_logs
+```
+
+터미널 3에서 MPC 컨테이너에 다시 들어가 키보드 노드만 직접 실행합니다.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
+ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true
+```
+
+ROS package는 이미지 복사본이 아니라 마운트된 workspace overlay에서 source됩니다. Python,
+launch, config 수정은 symlink를 통해 다음 프로세스/launch 시작 때 반영됩니다. package 구조나
+의존성 metadata가 바뀌면 관련 컨테이너에 강제 재빌드로 다시 진입합니다.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc FORCE_COLCON_BUILD=1
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3 FORCE_COLCON_BUILD=1
+```
+
+`make docker-build-gui` 또는 `make docker-build-dcp3`는 Dockerfile, OS package, Python 의존성을
+변경했을 때 이미지를 갱신하기 위한 명령이며 일반 ROS 소스 수정에는 필요 없다.
+
+키는 `w/s=x`, `a/d=y`, `r/f=z`, `u/o=roll`, `i/k=pitch`, `j/l=yaw`, `space=목표 초기화`,
+`q=종료`입니다. 측정 TCP는 시작 시 한 번만 목표로 복사되고 이후에는 키 입력 때만 목표가
+갱신됩니다. 키보드/MPC 실행만으로 실제 로봇을 arm하지 않습니다. 실기 구동 전 피드백,
+RViz의 실제/목표 TCP, 작업 공간을 확인하고 아래 [Hardware boundary](#hardware-boundary)의
+deadman 및 명시적 arm 순서를 따르십시오.
+
+```bash
+make docker-down-indy7
+```
+
+종료할 때는 각 launch 터미널에서 `Ctrl+C`를 누른 다음 컨테이너를 내립니다. `ROBOT_IP`는
+실제 Indy7 제어기 주소로 바꾸십시오.
 
 ## Hand retargetting 프로젝트
 
@@ -366,7 +414,9 @@ disarmed이며 명령과 deadman이 계속 들어오고 로봇이 IDLE일 때만
 deadman 또는 MPC 명령이 끊기거나 관절 제한을 벗어나면 teleop을 정지합니다.
 
 실기 MPC의 초기 목표는 첫 실제 joint state에서 계산한 현재 TCP pose입니다. 예제 YAML의
-목표 위치를 자동 실행하지 않습니다. 실제 연결은 두 컨테이너를 함께 시작합니다.
+목표 위치를 자동 실행하지 않습니다. `docker-up-indy7`은 GUI/DCP3 개발 컨테이너만 idle로
+준비하며 ROS 노드는 자동 launch하지 않습니다. 각 컨테이너 shell에 들어가 DCP3와 MPC
+launch를 직접 실행하십시오.
 
 ```bash
 make docker-up-indy7 ROBOT_IP=controller-address
@@ -374,9 +424,24 @@ make docker-up-indy7 ROBOT_IP=controller-address
 
 `controller-address`를 실제 Indy7 제어기 IP 주소로 바꿉니다.
 
-이 명령도 로봇을 arm하거나 움직이지 않습니다. 피드백과 MPC 목표가 정상인지 별도로
-확인한 다음, DCP3 컨테이너에서 deadman을 유지하고 명시적으로 arm해야 합니다. 상세 절차는
+이 명령 자체는 로봇에 연결하거나 arm하지 않습니다. 피드백과 MPC 목표가 정상인지 별도로
+확인한 다음, DCP3 shell에서 deadman을 유지하고 명시적으로 arm해야 합니다. 상세 절차는
 [`ros2_ws/src/indy7_dcp3/README.md`](ros2_ws/src/indy7_dcp3/README.md)를 참고하세요.
+
+실기 실행 순서는 DCP3 adapter, 실기 MPC/RViz, keyboard, 지속 deadman publisher 순입니다.
+deadman publisher는 실행 중인 채로 두고, 별도 DCP3 shell에서만 arm/disarm 서비스를
+호출합니다. 종료할 때는 먼저 `data: false`로 명시적으로 disarm한 뒤 launch와 publisher를
+종료합니다. 각 shell은 ROS와 마운트된 workspace overlay를 자동 source하므로 매번 수동
+`source`나 `colcon build`를 반복하지 않습니다. 소스는 `/workspace`에 read-only bind mount되어
+있어 편집은 호스트에서 하고, Python/launch/YAML 변경은 관련 노드를 재시작하면 반영됩니다.
+
+내일 끝단 선속도 실험을 위해 현재 설정을 기록합니다. MPC YAML의 `cartesian_max_speed`는
+`0.25 m/s`, `cartesian_max_angular_speed`는 `2.0 rad/s`이고, DCP3 YAML의 관절별
+`max_joint_velocity`는 `0.05 rad/s`입니다. MPC 값은 Cartesian 계획 상한이고 DCP3 값은
+관절 setpoint 제한이므로 같은 속도 개념이 아닙니다. 먼저 시뮬레이션에서 확인하고,
+실기에서는 `cartesian_max_speed`만 보수적으로 한 단계씩 바꿔 작은 직선 동작으로 검증합니다.
+DCP3 제한을 함께 올리지 말고, 계획 상한과 실제 TCP 응답을 구분해 진단 로그에서 확인합니다.
+YAML 수정은 호스트 소스에 바로 반영되므로 이미지 재빌드 없이 MPC를 재시작하면 됩니다.
 
 이 adapter는 충돌/작업공간 감시나 안전 정격 E-stop이 아닙니다. 첫 테스트는 낮은 속도,
 빈 작업공간, 물리 E-stop을 바로 누를 수 있는 상태에서 진행하고 제조사 안전 절차를

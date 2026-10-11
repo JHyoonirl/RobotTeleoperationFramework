@@ -18,6 +18,7 @@ def generate_launch_description():
     initialize_target_from_current_state = LaunchConfiguration(
         "initialize_target_from_current_state"
     )
+    diagnostic_log_directory = LaunchConfiguration("diagnostic_log_directory")
     joint_state_gui = LaunchConfiguration("joint_state_gui")
     plot = LaunchConfiguration("plot")
     rviz = LaunchConfiguration("rviz")
@@ -32,6 +33,7 @@ def generate_launch_description():
                     "urdf_path": str(urdf),
                     "simulate": simulate,
                     "initialize_target_from_current_state": initialize_target_from_current_state,
+                    "diagnostic_log_directory": diagnostic_log_directory,
                 },
             ],
             remappings=remappings,
@@ -58,6 +60,11 @@ def generate_launch_description():
                 "initialize_target_from_current_state",
                 default_value="false",
                 description="Seed the initial target from the first joint-state message",
+            ),
+            DeclareLaunchArgument(
+                "diagnostic_log_directory",
+                default_value="",
+                description="Directory for MPC run logs; empty uses the workspace logs folder",
             ),
             DeclareLaunchArgument(
                 "joint_state_gui",
@@ -129,7 +136,7 @@ def generate_launch_description():
                 name="rviz2",
                 arguments=["-d", str(share / "config" / "indy7.rviz")],
                 condition=IfCondition(rviz),
-                output="log",
+                output="screen",
             ),
             Node(
                 package="indy7_mpc",

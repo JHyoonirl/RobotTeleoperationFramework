@@ -142,6 +142,8 @@ class KeyboardTeleop(Node):
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
     def _on_current_pose(self, message: PoseStamped) -> None:
+        if self.pose_initialized:
+            return
         pose = message.pose
         position = [pose.position.x, pose.position.y, pose.position.z]
         orientation = [

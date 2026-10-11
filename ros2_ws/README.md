@@ -24,6 +24,8 @@ IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()` adapter에 연결한다.
 Crocoddyl Python stack을 사용한다. IndyDCP3 image는
 [`requirements-hardware.txt`](../robots/indy7/requirements-hardware.txt)의 Neuromeka SDK와
 NumPy 1 계열을 사용한다. Python ABI 충돌 방지를 위해 두 실행환경을 별도 이미지로 유지한다.
+모든 프로젝트 컨테이너와 `make run-mpc`는 `ROS_DOMAIN_ID=77`을 사용한다. 호스트에서 ROS 2
+명령을 직접 실행하는 경우에도 `export ROS_DOMAIN_ID=77`을 설정해 같은 DDS domain에 연결한다.
 
 IndyDCP3 통신 image에는 mock simulation과 시각화 의존성을 넣지 않는다. MPC image의 ROS
 패키지는 mock 시뮬레이션용 `ros2_control`, `controller_manager`,
@@ -54,6 +56,19 @@ make docker-test
 이미지는 계산(MPC)과 제조사 통신(DCP3) 역할에 따라 분리되어 있다.
 
 ## 실행
+
+일반 개발 흐름은 저장소 소스와 overlay를 연결하는 `make docker-run-gui`입니다. GUI image가
+없을 때만 준비한 뒤 셸을 열며, ROS node/launch는 자동 실행하지 않습니다. 셸 안에서 아래처럼
+원하는 launch를 직접 실행합니다. 반대로 이어지는 `docker run ...:mpc` 예제는 저수준 standalone
+실행법으로, image의 기본 CMD가 headless MPC launch를 자동 실행합니다. 소스 마운트 기반 개발
+중에는 기본 CMD를 쓰지 말고 `make docker-run-gui`를 사용하세요.
+
+```bash
+make docker-run-gui
+# 컨테이너 셸 안에서
+ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true rviz:=true plot:=true \
+  diagnostic_log_directory:=/tmp/indy7_sim_logs
+```
 
 ```bash
 docker run --rm --net=host --ipc=host \
@@ -87,13 +102,15 @@ MPC는 매 주기 `mpc/joint_position_cmd`에 `Float64MultiArray([q0..q5])`를
 발행하며 launch에서 `/forward_position_controller/commands`로 remap한다.
 Task-space 목표는 horizon의 모든 단계에서 같은 최종 pose를 추적하지 않고,
 현재 TCP에서 최종 목표까지의 직선 위치 기준과 SO(3) 방향 보간 기준으로
-분해된다. 기준 속도는 `cartesian_max_speed`(기본 0.05 m/s)와
-`cartesian_max_angular_speed`(기본 0.75 rad/s)로 각각 제한되며,
-현재 Jacobian과 URDF joint-velocity limit의 50%를 넘지 않도록 자동으로
-낮아진다. `cartesian_reference_topic`에서 현재 horizon 첫 번째 기준 pose를
+분해된다. 코드 parameter 기본값은 `cartesian_max_speed=0.05 m/s`,
+`cartesian_max_angular_speed=0.75 rad/s`, `cartesian_speed_margin=0.5`지만,
+실행 시 읽는 [`indy7_mpc.yaml`](src/indy7_mpc/config/indy7_mpc.yaml)이 이를
+덮어쓴다. 현재 YAML은 각각 `0.25 m/s`, `2.0 rad/s`, `1.0`으로 설정되어 있다.
+실제 Cartesian 선속도 기준은 이 상한과 현재 방향의 Jacobian/URDF joint-velocity
+제한으로 계산한 값 중 작은 값이다. `cartesian_reference_topic`에서 현재 horizon 첫 번째 기준 pose를
 확인할 수 있다.
 RViz 설정(`config/indy7.rviz`)은 로봇 Alpha를 `0.5`로 표시하고 `tcp` TF 기준의 TCP Axes display를 항상 켠다.
-launch를 실행하면 `mpc_plotter`가 함께 열려 position/orientation 오차, 전체 cost, solver 성공 여부·계산시간, control norm, 최소 joint-limit 여유를 실시간으로 표시한다. GUI가 없는 환경에서는 `plot:=false`로 끌 수 있다.
+launch를 실행하면 `mpc_plotter`가 함께 열려 position/orientation 오차, 전체 cost, solver 성공 여부·계산시간, control norm, 최소 joint-limit 여유를 실시간으로 표시한다. 주기적 plot 갱신은 창 포커스를 반복해서 가져오지 않는다. GUI가 없는 환경에서는 `plot:=false`로 끌 수 있다.
 
 동시에 진단 로그가 기본적으로 컨테이너 내부의
 `/opt/robot_teleoperation_framework/logs/indy7_mpc/<UTC timestamp>/trace.jsonl`에 저장된다.
@@ -145,20 +162,34 @@ docker exec robot-teleoperation bash -lc \
 `plots/summary.json`이 생성된다. `summary.json`에는 cost·tracking·solver·ABA
 동역학의 최종값/평균/최댓값이 들어 있다.
 
-입력 pose의 `header.frame_id`는 기본적으로 `world`여야 한다. 다른 frame을 쓰려면 먼저 TF 변환을 추가하거나 `pose_frame`을 맞춘다. `q_cmd`에는 URDF hard joint limit, measured-q 기준 velocity limit, cycle increment limit을 모두 적용한다. 실기에서는 `mpc/joint_position_cmd`를 IndyDCP3 adapter의 입력으로 사용하고, adapter에서 rad→deg 변환 및 deadman/E-stop을 추가한다. 실행 중 Crocoddyl 전체 목적함수 값은 다음 토픽에서 확인할 수 있다.
+입력 pose의 `header.frame_id`는 기본적으로 `world`여야 한다. 다른 frame을 쓰려면 먼저 TF 변환을 추가하거나 `pose_frame`을 맞춘다. `q_cmd`에는 URDF hard joint limit, measured-q 기준 velocity limit, cycle increment limit을 모두 적용한다. 실기에서는 `mpc/joint_position_cmd`를 IndyDCP3 adapter의 입력으로 사용하고, adapter에서 rad→deg 변환과 deadman/명령 watchdog을 적용한다. 물리 E-stop은 별도로 준비해야 한다. 실행 중 Crocoddyl 전체 목적함수 값은 다음 토픽에서 확인할 수 있다.
 
-Cartesian 속도 관련 YAML 파라미터는 다음과 같다.
+현재 적용 중인 Cartesian 속도 관련 YAML 파라미터는 다음과 같다.
 
 ```yaml
-cartesian_max_speed: 0.05       # m/s, 사용자가 정하는 상한
-cartesian_max_angular_speed: 0.75 # rad/s, orientation 상한
-cartesian_speed_margin: 0.5     # joint velocity limit의 사용 비율
+cartesian_max_speed: 0.25         # m/s, 직선 이동 기준 상한
+cartesian_max_angular_speed: 2.0  # rad/s, orientation 상한
+cartesian_speed_margin: 1.0       # Jacobian 제한 계산에 적용할 URDF 속도 비율
 cartesian_min_duration: 0.10    # 너무 짧은 목표 이동 방지 [s]
 ```
 
-실제 위치 기준 속도는 `min(cartesian_max_speed, Jacobian 기반 joint-velocity cap)`이고,
-orientation 기준은 `cartesian_max_angular_speed`에 의해 별도로 제한된다.
-따라서 특이점 근처에서는 자동으로 느려질 수 있다. teleoperation pose가 연속해서
+`cartesian_max_speed`는 계획 기준의 상한이지 측정 TCP가 그 속도로 움직인다는 보장은
+아니다. 실제 선속도는 Jacobian 제한, MPC의 관절 명령 필터, 실기 DCP3 adapter의 별도
+관절별 변화 제한에도 영향을 받는다. 특히 현재 [`indy7_dcp3.yaml`](src/indy7_dcp3/config/indy7_dcp3.yaml)의
+`max_joint_velocity`는 각 관절 `0.05 rad/s`다. 이것은 TCP 선속도 단위가 아니며,
+Cartesian 속도 상한과 서로 바꿔 쓸 수 없다. 이 하드웨어 제한을 올리는 일은 제조사 및
+실험실 안전 조건을 확인한 별도 검증 후에만 고려한다.
+
+끝단 선속도를 더 높이는 실험은 먼저 시뮬레이션에서 확인하고, 실기에서는 작업공간을
+비운 뒤 물리 E-stop에 손이 닿는 상태에서 작은 직선 이동으로 한 설정만 단계적으로
+변경한다. 호스트에서 위 YAML의 `cartesian_max_speed`를 조정하고 MPC launch를 재시작하면
+된다. 소스가 `/workspace`에 마운트되어 있으므로 일반 YAML 수정은 Docker 이미지 빌드나
+colcon 재빌드가 필요 없다. `cartesian_path.speed_limit_m_s`는 Jacobian 제한까지 반영한
+계획 속도 상한이며 측정 속도 자체는 아니다. 실제 응답은 연속된 `/mpc/current_pose` 또는
+진단 로그의 현재 pose/time을 비교해 확인한다. 속도 실험 중에는 orientation 상한이나
+DCP3 `max_joint_velocity`를 동시에 변경하지 않는다.
+
+특이점 근처에서는 계획 속도가 자동으로 낮아질 수 있다. teleoperation pose가 연속해서
 들어오는 동안에는 path 시작점을 매번 재설정하지 않고, 현재 line의 목표점만
 갱신한다. 진단 JSONL의 `cartesian_path`에 start/goal/reference horizon,
 적용 선속도·각속도 제한, 진행률, line 기준 편차가 기록된다.
@@ -294,58 +325,95 @@ make docker-build
 make docker-test
 ```
 
-실제 제어기 IP로 두 서비스를 시작한다. 아래 문자열을 장비의 실제 주소로 바꾼다.
+실제 제어기 IP로 idle 개발 컨테이너를 시작한다. 아래 문자열을 장비의 실제 주소로 바꾼다.
+이 명령은 ROS 노드를 launch하지 않으며, 로봇을 arm하거나 움직이지 않는다.
 
 ```bash
 make docker-up-indy7 ROBOT_IP=controller-address
 ```
 
-Compose는 `dcp3` adapter와 `simulate:=false`인 MPC를 시작한다. MPC는 첫 실측 joint state의
-TCP pose를 목표로 초기화한다. 시작만으로 로봇을 arm하거나 움직이지 않는다. 다른 터미널에서
-먼저 피드백과 pose를 확인한다.
+별도 터미널에서 서비스별 shell을 열고 노드를 직접 실행한다. ROS, Python 환경, 마운트된
+소스 overlay는 shell 진입 때 자동으로 source된다. 첫 shell 진입 때만 overlay를 준비한다.
+일반 Python/launch/YAML 수정은 이미지 빌드 없이 반영되고, package 구조나 의존성 metadata를
+바꾼 경우에만 `FORCE_COLCON_BUILD=1`로 해당 overlay를 다시 빌드한다.
+
+터미널 1에서 DCP3 adapter를 실행한다.
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /joint_states --once'
-docker compose -f docker/compose.indy7.yaml exec mpc \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /mpc/current_pose --once'
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$INDY7_ROBOT_IP
 ```
 
-키보드 입력을 현재 TCP 자세에 동기화해 별도 터미널에서 실행한다. 첫 publish가 현재 자세와
-일치하므로 기본 예제 pose로의 초기 점프를 피한다.
+터미널 2에서 실기 MPC, RViz, 진단 plot을 실행한다. MPC 목표는 첫 실측 상태의 현재 TCP
+자세로 초기화된다.
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec mpc \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true'
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
+ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=false \
+  initialize_target_from_current_state:=true rviz:=true plot:=true \
+  diagnostic_log_directory:=/tmp/indy7_mpc_logs
 ```
 
-deadman을 지속 발행하는 터미널을 별도로 열어 둔다. Ctrl+C로 발행이 끊기면 0.3초 후
-adapter가 teleop을 정지하고 disarm한다.
+터미널 3에서 키보드 입력을 현재 TCP 자세에 동기화해 실행한다. 측정 자세는 최초 한 번만
+목표에 복사되며, 이후 목표는 키 입력 때만 갱신된다.
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic pub -r 10 /indy7_dcp3/deadman std_msgs/msg/Bool "{data: true}"'
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
+ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true
 ```
 
-피드백·목표·deadman을 확인하고 작업공간을 비운 뒤, 물리 E-stop에 바로 접근할 수 있을 때만
-arm 서비스를 호출한다.
+터미널 4에서 deadman heartbeat를 발행한다. 10 Hz로 계속 발행해야 하므로 이 명령은
+별도 터미널에서 계속 실행해 둔다. 발행이 끊기면 기본 0.3초 timeout 뒤 adapter가 정지 및
+disarm 절차를 수행한다. 이 ROS heartbeat는 물리 deadman이나 E-stop이 아니다.
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: true}"'
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+ros2 topic pub -r 10 /indy7_dcp3/deadman std_msgs/msg/Bool "{data: true}"
 ```
 
-정지는 `data: false`를 호출하거나 deadman 발행을 끊는다. adapter는 기본적으로 관절별
-setpoint 변화를 발행 주기 기준 0.05 rad/s에 해당하는 양으로 제한하고 URDF soft limit
-margin 0.05 rad를 적용한다. DCP3는 IDLE일 때만 arm된다. 이 setpoint 제한은 안전 정격
-속도 감시를 의미하지 않는다.
-소프트웨어 정지는 비상정지를 대신하지 않는다. 물리 E-stop을 즉시 누를 수 있게 하고,
-충돌 감시/작업공간 감시는 별도 기능으로 남아 있다.
+arm 전에는 별도 확인 shell에서 실제 관절 feedback, 현재 TCP, MPC command/목표를 확인한다.
+키보드 목표가 현재 자세에서 작은 이동으로 바뀌는지, DCP3가 IDLE인지, 작업공간이 비었는지
+확인하고 물리 E-stop에 즉시 접근할 수 있어야 한다.
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"'
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+ros2 topic echo /joint_states --once
+ros2 topic echo /indy7_dcp3/deadman --once
 ```
 
-두 컨테이너는 `make docker-down-indy7`로 종료한다. 안전 제한 및 watchdog은 안전 정격이
-아니며, 물리 E-stop과 제조사 commissioning 절차를 대체하지 않는다.
+```bash
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
+ros2 topic echo /mpc/current_pose --once
+ros2 topic echo /mpc/desired_pose --once
+ros2 topic echo /mpc/joint_position_cmd --once
+```
+
+deadman publisher를 켜 둔 채 **다른 DCP3 shell**에서 arm한다. arm 요청은 DCP3 feedback과 MPC
+command가 최신이고, deadman이 살아 있으며, 로봇이 IDLE이고 목표가 제한 안에 있을 때만
+수락된다. arm 이후부터 MPC의 절대 관절 목표가 실제 로봇에 전달된다.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: true}"
+```
+
+정상 종료는 **다른 DCP3 shell에서 먼저 명시적으로 disarm**한 뒤 각 launch와 keyboard
+프로세스를 `Ctrl+C`로 종료하고, 마지막에 deadman publisher를 `Ctrl+C`로 끝낸다. 그 다음
+idle 컨테이너를 종료한다. deadman을 끊으면 watchdog도 정지시키지만, 정상 종료 절차에서는
+그것을 disarm 명령 대신 사용하지 않는다.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"
+```
+
+```bash
+make docker-down-indy7
+```
+
+현재 MPC YAML의 `cartesian_max_speed`는 `0.25 m/s`이고, 실기 DCP3 YAML의 관절별
+`max_joint_velocity`는 `0.05 rad/s`다. 전자는 계획된 TCP 직선 이동 상한, 후자는 관절
+setpoint 변화 제한으로 서로 다른 제약이다. 속도를 높이는 실험은 `cartesian_max_speed`만
+한 번에 한 단계 조정하고, 실제 TCP 응답과 진단 로그를 확인한다. DCP3 관절 제한을 올리는
+것은 별도 안전 검토 없이 하지 않는다. 모든 software limit/watchdog은 안전 정격이 아니며,
+물리 E-stop, 충돌 감시, 작업공간 감시를 대체하지 않는다.

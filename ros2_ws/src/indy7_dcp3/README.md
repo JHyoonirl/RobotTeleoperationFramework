@@ -15,74 +15,144 @@ These software checks are not safety-rated. They do not provide collision monito
 supervision, or a safety-rated E-stop. Keep the physical E-stop accessible and follow Neuromeka's
 commissioning and safety procedures.
 
-## Build and Start
+## Developer Run
 
 The DCP3 image installs the Neuromeka Python client from
 [`robots/indy7/requirements-hardware.txt`](../../../robots/indy7/requirements-hardware.txt).
-It has its own Python runtime, separate from the MPC image's NumPy 2 / Crocoddyl stack. Build and
-test both images:
+It has its own Python runtime, separate from the MPC image's NumPy 2 / Crocoddyl stack. Build the
+images initially or after Dockerfile/dependency changes, and run image tests when validating a
+build. Ordinary mounted ROS source or YAML edits do not need these commands:
 
 ```bash
 make docker-build
 make docker-test
 ```
 
-Start the MPC and DCP3 services using the controller's actual IP:
+Start from a Linux desktop session with X11/XWayland available. This prepares idle MPC and DCP3
+containers; no ROS nodes are launched automatically. The repository is mounted read-only, and
+each container builds a persistent `--symlink-install` overlay from that mounted source on first
+shell entry. Ordinary source edits are picked up when the affected node is restarted; image rebuilds
+are only needed for Dockerfile, system package, or Python dependency changes.
 
 ```bash
 make docker-up-indy7 ROBOT_IP=controller-address
 ```
 
-The DCP3 adapter publishes feedback; the MPC runs with `simulate:=false` and initializes its
-Cartesian target from the measured state. The DCP3 node starts disarmed. Startup does not arm or
-move the robot. Verify `/joint_states` and `/mpc/current_pose` from another terminal:
-
-In that second terminal, export the controller IP before using `docker compose` commands. Compose
-validates `INDY7_ROBOT_IP` while loading the file, even for `exec`:
+Terminal 1: launch the hardware adapter. ROS, the Python venv, and the mounted source overlay are
+sourced automatically when the shell opens.
 
 ```bash
-export INDY7_ROBOT_IP=controller-address
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$INDY7_ROBOT_IP
+```
+
+Terminal 2: launch MPC with RViz and the live diagnostics plot. Its ROS environment is also sourced
+on shell entry.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=mpc
+ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=false \
+  initialize_target_from_current_state:=true rviz:=true plot:=true \
+  diagnostic_log_directory:=/tmp/indy7_mpc_logs
+```
+
+RViz shows the real joint state, measured TCP, and teleoperation target. The DCP3 node starts
+disarmed. Starting either container or changing the keyboard target does not arm or move the robot.
+
+Terminal 3: open another MPC shell and run the keyboard node manually.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=mpc
+ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true
+```
+
+Python, launch, and config changes in the mounted source do not require an image rebuild. For
+package-layout or dependency metadata changes that require colcon, force the corresponding overlay
+to rebuild on shell entry:
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=mpc FORCE_COLCON_BUILD=1
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3 FORCE_COLCON_BUILD=1
+```
+
+Do not repeat colcon build on every shell entry.
+
+The keyboard node accepts `w/s=x`, `a/d=y`, `r/f=z`, `u/o=roll`, `i/k=pitch`, `j/l=yaw`,
+`space=reset target`, and `q=quit`. It only changes the MPC target. It does not arm or move the
+robot.
+
+For ROS graph and feedback inspection, open another sourced shell:
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 topic echo /joint_states --once
+ros2 topic echo /indy7_dcp3/deadman --once
+```
+
+In another MPC shell, inspect the measured pose:
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=mpc
+ros2 topic echo /mpc/current_pose --once
+```
+
+The initial measured TCP pose is copied into the keyboard target only once. After that, the target
+changes only on a key press.
+
+Terminal 4: keep this deadman publisher running continuously at 10 Hz. It is a ROS heartbeat,
+not a physical deadman switch or E-stop. If the messages stop, the adapter's 0.3 second timeout
+stops teleoperation and disarms:
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 topic pub -r 10 /indy7_dcp3/deadman std_msgs/msg/Bool "{data: true}"
+```
+
+Before arming, inspect the measured joints, measured TCP, desired TCP, and latest MPC joint
+command from separate shells. Check that the target is still near the measured pose, the robot is
+in IDLE, the work area is clear, and the physical E-stop is immediately reachable:
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 topic echo /joint_states --once
+ros2 topic echo /indy7_dcp3/deadman --once
 ```
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 bash -lc \
-  'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /joint_states --once'
-docker compose -f docker/compose.indy7.yaml exec mpc bash -lc \
-  'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic echo /mpc/current_pose --once'
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=mpc
+ros2 topic echo /mpc/current_pose --once
+ros2 topic echo /mpc/desired_pose --once
+ros2 topic echo /mpc/joint_position_cmd --once
 ```
 
-Only after confirming state, clearing the work area, and ensuring the physical E-stop is within
-reach, start keyboard input in a separate terminal. The initial target is synchronized to the
-measured TCP pose:
+Terminal 5: leave the deadman publisher running in Terminal 4, then explicitly arm from another
+DCP3 shell. Arming requires fresh DCP3 feedback, a fresh MPC command, a live deadman, IDLE state,
+and a valid joint target. Only after arming can the MPC's absolute joint target reach the robot:
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec mpc \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true'
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: true}"
 ```
 
-Keep a deadman publisher running separately. If it stops, the adapter disarms after 0.3 seconds:
+To stop normally, first open another DCP3 shell and explicitly disarm. Then stop keyboard, MPC,
+and DCP3 launch processes with `Ctrl+C`; stop the deadman publisher last, and finally remove the
+idle containers. Do not use the deadman timeout as a substitute for the normal disarm command:
 
 ```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 topic pub -r 10 /indy7_dcp3/deadman std_msgs/msg/Bool "{data: true}"'
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"
 ```
 
-Only after verifying feedback, target, and deadman, explicitly arm the driver:
+Stop each manually launched ROS process with `Ctrl+C`, then remove the idle containers with
+`make docker-down-indy7`.
 
-```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: true}"'
-```
-
-Stop with an explicit disarm request:
-
-```bash
-docker compose -f docker/compose.indy7.yaml exec dcp3 \
-  bash -lc 'source /opt/ros/jazzy/setup.bash && source /opt/robot_teleoperation_framework/install/setup.bash && ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"'
-```
-
-Then stop both containers with `make docker-down-indy7` or Ctrl+C in the attached Compose
-terminal.
+For the planned TCP speed test, the current MPC YAML has `cartesian_max_speed: 0.25` m/s and
+`cartesian_max_angular_speed: 2.0` rad/s. The DCP3 YAML independently caps joint target changes at
+`max_joint_velocity: 0.05` rad/s per joint. The MPC value limits the planned Cartesian path; it is
+not a measured TCP speed guarantee, and the adapter's joint cap is not a TCP speed. Start by
+changing only `cartesian_max_speed` in the host-mounted YAML, validate in simulation, then restart
+MPC and measure the actual TCP response. This source/config edit does not require rebuilding the
+Docker image. Do not raise the DCP3 joint cap without a separate safety review.
 
 The adapter uses the IndyDCP3 mode and operation-state conventions from Neuromeka's
 [official Indy ROS 2 driver](https://github.com/neuromeka-robotics/indy-ros2/tree/jazzy-indyDCP3).

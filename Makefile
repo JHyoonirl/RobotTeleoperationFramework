@@ -1,6 +1,7 @@
 ROS_DISTRO ?= jazzy
 ROS_SETUP := /opt/ros/$(ROS_DISTRO)/setup.bash
 REPO_ROOT := $(CURDIR)
+export ROS_DOMAIN_ID := 77
 
 ROS_WS := $(REPO_ROOT)/ros2_ws
 ROS_SOURCES := $(ROS_WS)/src
@@ -8,11 +9,15 @@ PYTHON := $(REPO_ROOT)/.venv/bin/python
 DOCKER_IMAGE ?= robot-teleoperation-framework
 INCLUDE_HAND ?= 0
 DOCKER_TAG := mpc
+INDY7_SERVICE ?= mpc
+FORCE_COLCON_BUILD ?= 0
 DOCKER_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
 	/workspace/ros2_ws/src/indy7_mpc \
 	/workspace/ros2_ws/src/vive_tracker_ros2
+DOCKER_DCP3_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
+	/workspace/ros2_ws/src/indy7_dcp3
 
-.PHONY: build build-hand test list run-mpc docker-build docker-build-dcp3 docker-build-gui docker-test docker-run docker-run-gui docker-build-hand docker-up-hand docker-down-hand docker-check-indy7 docker-up-indy7 docker-down-indy7
+.PHONY: build build-hand test list run-mpc docker-build docker-build-dcp3 docker-build-gui docker-test docker-run docker-run-gui docker-build-hand docker-up-hand docker-down-hand docker-check-indy7 docker-up-indy7 docker-shell-indy7 docker-down-indy7
 
 build:
 	@test -f "$(ROS_SETUP)" || (echo "ROS 2 setup not found: $(ROS_SETUP)"; exit 1)
@@ -63,41 +68,78 @@ docker-check-indy7:
 	@test -n "$(ROBOT_IP)" || (echo "Set ROBOT_IP to the Indy7 controller address"; exit 2)
 	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
 	INDY7_ROBOT_IP=$(ROBOT_IP) \
-	docker compose -f docker/compose.indy7.yaml up dcp3
+	docker compose -f docker/compose.indy7.yaml run --rm --no-deps dcp3 \
+		bash -lc 'set -e; source /opt/ros/jazzy/setup.bash; source /opt/robot-teleoperation-venv/bin/activate; cd /workspace/ros2_ws; python3 -m colcon --log-base /tmp/indy7_dcp3_ws/log build --symlink-install --merge-install --base-paths /workspace/ros2_ws/src/indy7_description /workspace/ros2_ws/src/indy7_dcp3 --build-base /tmp/indy7_dcp3_ws/build --install-base /tmp/indy7_dcp3_ws/install; source /tmp/indy7_dcp3_ws/install/setup.bash; exec ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$$INDY7_ROBOT_IP'
 
 docker-test:
 	docker run --rm $(DOCKER_IMAGE):$(DOCKER_TAG) python3 -m colcon test-result --verbose
 	docker run --rm $(DOCKER_IMAGE):dcp3 python3 -m colcon test-result --verbose
 
 docker-run:
+	@mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc"
 	docker run --rm -it --name robot-teleoperation --net=host --ipc=host \
-		--user "$$(id -u):$$(id -g)" -e HOME=/tmp \
-		-v "$(REPO_ROOT):/workspace" -w /workspace \
+		--user "$$(id -u):$$(id -g)" -e HOME=/tmp -e ROS_DOMAIN_ID=77 \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) \
+		-v "$(REPO_ROOT):/workspace" \
+		-v "$(REPO_ROOT)/.docker-data/indy7-mpc:/var/lib/robot-teleoperation-dev" \
+		-w /workspace \
 		$(DOCKER_IMAGE):$(DOCKER_TAG) \
-		bash -lc 'source /opt/ros/jazzy/setup.bash && cd /workspace/ros2_ws && python3 -m colcon build --symlink-install --merge-install --base-paths $(DOCKER_BASE_PATHS) && source install/setup.bash && cd /workspace && exec bash'
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(DOCKER_BASE_PATHS) -- bash
 
 docker-up-indy7:
 	@test -n "$(ROBOT_IP)" || (echo "Set ROBOT_IP to the Indy7 controller address"; exit 2)
-	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):$(DOCKER_TAG) \
-	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
-	INDY7_ROBOT_IP=$(ROBOT_IP) \
-	docker compose -f docker/compose.indy7.yaml up
+	@test -n "$$DISPLAY" || (echo "DISPLAY is not set; run this from a desktop session with X11 support"; exit 2)
+	@set -e; \
+		xauthority_file="$${XAUTHORITY:-$$HOME/.Xauthority}"; \
+		test -r "$$xauthority_file" || { echo "X11 authorization file is not readable: $$xauthority_file"; exit 2; }; \
+		if ! docker image inspect "$(DOCKER_IMAGE):mpc-gui" >/dev/null 2>&1; then \
+			$(MAKE) docker-build-gui DOCKER_IMAGE=$(DOCKER_IMAGE); \
+		fi; \
+		if ! docker image inspect "$(DOCKER_IMAGE):dcp3" >/dev/null 2>&1; then \
+			$(MAKE) docker-build-dcp3 DOCKER_IMAGE=$(DOCKER_IMAGE); \
+		fi; \
+		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc" "$(REPO_ROOT)/.docker-data/dcp3"; \
+		ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+		INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+		INDY7_ROBOT_IP=$(ROBOT_IP) \
+		LOCAL_UID="$$(id -u)" LOCAL_GID="$$(id -g)" \
+		XAUTHORITY_FILE="$$xauthority_file" \
+		docker compose -f docker/compose.indy7.yaml up -d; \
+		echo "Dev containers are ready. Enter with: make docker-shell-indy7 ROBOT_IP=$(ROBOT_IP) INDY7_SERVICE=mpc (or dcp3)"
+
+docker-shell-indy7:
+	@test -n "$(ROBOT_IP)" || (echo "Set ROBOT_IP to the Indy7 controller address"; exit 2)
+	@case "$(INDY7_SERVICE)" in mpc|dcp3) ;; *) echo "INDY7_SERVICE must be mpc or dcp3"; exit 2 ;; esac
+	INDY7_ROBOT_IP=$(ROBOT_IP) docker compose -f docker/compose.indy7.yaml exec \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) $(INDY7_SERVICE) \
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(if $(filter $(INDY7_SERVICE),mpc),$(DOCKER_BASE_PATHS),$(DOCKER_DCP3_BASE_PATHS)) -- bash
 
 docker-down-indy7:
-	docker compose -f docker/compose.indy7.yaml down
+	INDY7_ROBOT_IP="$${INDY7_ROBOT_IP:-127.0.0.1}" docker compose -f docker/compose.indy7.yaml down
 
 docker-run-gui:
 	@test -n "$$DISPLAY" || { echo "DISPLAY is not set; run this from an X11 desktop session"; exit 1; }
-	$(MAKE) docker-build-gui
-	@XAUTHORITY_FILE="$${XAUTHORITY:-$$HOME/.Xauthority}"; \
-		test -r "$$XAUTHORITY_FILE" || { echo "X11 authorization file is not readable: $$XAUTHORITY_FILE"; exit 1; }; \
-		docker run --rm --name robot-teleoperation --net=host --ipc=host \
-			--user "$$(id -u):$$(id -g)" -e HOME=/tmp \
+	@set -e; \
+		xauthority_file="$${XAUTHORITY:-$$HOME/.Xauthority}"; \
+		test -r "$$xauthority_file" || { echo "X11 authorization file is not readable: $$xauthority_file"; exit 1; }; \
+		if ! docker image inspect "$(DOCKER_IMAGE):mpc-gui" >/dev/null 2>&1; then \
+			docker buildx build --load --target mpc-gui \
+				-f docker/Dockerfile -t "$(DOCKER_IMAGE):mpc-gui" .; \
+		fi; \
+		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc"; \
+		docker run --rm -it --name robot-teleoperation --net=host --ipc=host \
+			--user "$$(id -u):$$(id -g)" -e HOME=/tmp -e ROS_DOMAIN_ID=77 \
+			-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) \
 			-e "DISPLAY=$$DISPLAY" \
 			-e XAUTHORITY=/tmp/.Xauthority \
 			-e QT_X11_NO_MITSHM=1 \
-			-v "$$XAUTHORITY_FILE:/tmp/.Xauthority:ro" \
+			-v "$$xauthority_file:/tmp/.Xauthority:ro" \
 			-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
-			-v "$(REPO_ROOT):/workspace" -w /workspace \
+			-v "$(REPO_ROOT):/workspace" \
+			-v "$(REPO_ROOT)/.docker-data/indy7-mpc:/var/lib/robot-teleoperation-dev" \
+			-w /workspace \
 			$(DOCKER_IMAGE):mpc-gui \
-			bash -lc 'source /opt/ros/jazzy/setup.bash && cd /workspace/ros2_ws && python3 -m colcon build --symlink-install --merge-install --base-paths $(DOCKER_BASE_PATHS) && source install/setup.bash && ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=true plot:=false'
+			bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+			$(DOCKER_BASE_PATHS) -- bash

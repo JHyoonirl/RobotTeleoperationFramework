@@ -6,6 +6,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     ROS_DISTRO=jazzy \
+    ROS_DOMAIN_ID=77 \
     PYTHONUNBUFFERED=1 \
     MPLCONFIGDIR=/tmp/matplotlib
 

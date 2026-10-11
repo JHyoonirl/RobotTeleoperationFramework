@@ -78,6 +78,7 @@ class MpcPlotter(Node):
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, 10)
 
         try:
+            import matplotlib
             import matplotlib.pyplot as plt
         except ImportError as exc:
             raise RuntimeError(
@@ -141,6 +142,7 @@ class MpcPlotter(Node):
         self.ax_success.set_ylim(-0.05, 1.05)
         self.figure.tight_layout(rect=(0.0, 0.0, 1.0, 0.95))
         self.plt.show(block=False)
+        matplotlib.rcParams["figure.raise_window"] = False
         self.timer = self.create_timer(self.plot_period, self._redraw)
         self.get_logger().info(
             "Live MPC plotter started: errors, cost, solver health, control norm, joint margin"
@@ -247,7 +249,6 @@ class MpcPlotter(Node):
         )
         self.figure.canvas.draw_idle()
         self.figure.canvas.flush_events()
-        self.plt.pause(0.001)
 
     def destroy_node(self):
         if hasattr(self, "figure"):
