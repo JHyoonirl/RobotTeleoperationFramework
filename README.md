@@ -123,6 +123,10 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-up-indy7 ROBOT_IP=<주소>` | GUI 지원 MPC/DCP3 개발 컨테이너만 백그라운드로 준비합니다. ROS 노드는 자동 실행하지 않습니다. |
 | `make docker-shell-indy7 ROBOT_IP=<주소> INDY7_SERVICE=<service>` | `INDY7_SERVICE`를 `mpc` 또는 `dcp3`로 지정해 해당 컨테이너 shell에 들어갑니다. |
 | `make docker-down-indy7` | Indy7 Compose 컨테이너를 종료하고 정리합니다. |
+| `make docker-up-indy7-sim` | 실제 IP 없이 MPC 시뮬레이션 컨테이너만 시작합니다. DCP3 컨테이너는 시작하지 않습니다. |
+| `make docker-launch-indy7-sim` | mock ros2_control 시뮬레이션, RViz, MPC plot을 실행합니다. |
+| `make docker-keyboard-indy7-sim` | 별도 터미널에서 키보드 TCP teleoperation을 실행합니다. |
+| `make docker-down-indy7-sim` | simulation MPC 컨테이너를 중지합니다. |
 
 컨테이너에는 저장소가 `/workspace`로 마운트되고, MPC 패키지는 이 마운트된 소스에서
 `--symlink-install`로 실행됩니다. 첫 진입 때만 colcon overlay를 `.docker-data/indy7-mpc`에
@@ -131,7 +135,23 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 `make docker-run-gui FORCE_COLCON_BUILD=1`을 사용하세요. `docker-build-gui`는 GUI/시스템
 의존성이나 Dockerfile 변경 시 이미지 자체를 갱신할 때 사용합니다. 기본 MPC 시뮬레이션은
 셸에서 직접 launch하며 `simulate`의 기본값은 `true`입니다. 소스 편집은 실행 중인 Python
-프로세스에 hot reload되지 않으므로, 수정한 노드나 launch를 재시작하면 변경이 적용됩니다.
+프로세스에 자동 반영되지 않으므로, 수정한 노드나 launch 코드는 MPC를 재시작해야 적용됩니다.
+
+MPC cost 항목은 예외로, 실행 중인 노드가 로컬 마운트 파일을 0.25초 간격으로 확인합니다.
+호스트에서 다음 파일을 저장하면 컨테이너 안의 같은 파일이 즉시 보이고, 유효한 cost 변경은
+현재 solver에 다시 반영됩니다. YAML을 잠시 잘못된 상태로 저장해도 마지막 유효 설정을 유지하고,
+파일을 고친 뒤 다시 저장하면 적용됩니다.
+
+```text
+ros2_ws/src/indy7_mpc/config/indy7_mpc.yaml
+```
+
+실행 중 바꿀 수 있는 항목은 `se3_position_cost_weight`, `se3_orientation_cost_weight`,
+`posture_cost_weight`, `velocity_cost_weight`, `torque_cost_weight`,
+`joint_limit_cost_weight`, `running_cost_weight`, `terminal_cost_weight`, `nominal_posture`입니다.
+`horizon`, `dt`, solver 반복 횟수, 토픽과 제어 모드처럼 solver 구조나 노드 시작 시 설정되는 항목은
+재시작해야 적용됩니다. 실행 로그에 `Applied live MPC cost YAML update`가 나오면 새 cost가
+적용된 것입니다.
 
 ```bash
 make docker-run-gui
@@ -139,6 +159,40 @@ make docker-run-gui
 ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true rviz:=true plot:=true \
   diagnostic_log_directory:=/tmp/indy7_sim_logs
 ```
+
+키보드 TCP teleoperation은 실제 로봇 주소나 DCP3 드라이버 없이 아래처럼 실행할 수 있습니다.
+먼저 시뮬레이션 컨테이너를 준비하고, 첫 번째 터미널에서 MPC/RViz를 실행한 다음 두 번째 터미널에서
+키보드 노드를 실행합니다.
+
+```bash
+make docker-up-indy7-sim
+```
+
+터미널 1:
+
+```bash
+make docker-launch-indy7-sim
+```
+
+터미널 2:
+
+```bash
+make docker-keyboard-indy7-sim
+```
+
+키는 `w/s=world X`, `a/d=world Y`, `r/f=world Z`, `u/o=roll`, `i/k=pitch`, `j/l=yaw`,
+`space=시작 TCP로 복귀`, `q=키보드 노드 종료`입니다. 기본 위치 스텝은 1 cm, 회전 스텝은 5°이며,
+키를 누르면 목표 TCP가 해당 스텝만큼 바뀝니다. RViz에서 로봇과 target pose를 보면서 시험하고,
+종료할 때는 두 터미널에서 `Ctrl+C`를 누른 뒤 다음 명령으로 MPC 컨테이너를 중지합니다.
+
+```bash
+make docker-down-indy7-sim
+```
+
+같은 시뮬레이션 launch를 두 번 실행하면 controller manager가 충돌하므로, 실행 중에는
+`make docker-launch-indy7-sim`을 다시 실행하지 마세요. launch 타깃은 중복 실행을 거부합니다.
+완전히 재시작하려면 `docker-down-indy7-sim`으로 MPC 컨테이너를 멈춘 뒤 `docker-up-indy7-sim`을
+실행하고 launch와 keyboard 명령을 다시 시작하세요.
 
 별도 터미널에서 launch가 실행 중일 때 시뮬레이터와 MPC 출력도 확인할 수 있습니다.
 

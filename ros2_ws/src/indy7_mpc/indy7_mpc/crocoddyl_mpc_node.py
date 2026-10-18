@@ -23,6 +23,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Float64MultiArray
 
+from .mpc_cost_config import apply_runtime_cost_settings, load_runtime_cost_settings
 from .se3_dynamic_model import SE3DynamicActionModel
 
 
@@ -30,6 +31,7 @@ class CrocoddylMPCNode(Node):
     def __init__(self) -> None:
         super().__init__("indy7_crocoddyl_mpc")
         self.declare_parameter("urdf_path", "")
+        self.declare_parameter("config_file_path", "")
         self.declare_parameter("control_mode", "task_space")
         self.declare_parameter("task_frame", "tcp")
         self.declare_parameter("pose_frame", "world")
@@ -103,6 +105,16 @@ class CrocoddylMPCNode(Node):
         urdf_path = Path(str(self.get_parameter("urdf_path").value))
         if not urdf_path.is_file():
             raise FileNotFoundError(f"URDF를 찾을 수 없습니다: {urdf_path}")
+        config_file_path = str(self.get_parameter("config_file_path").value).strip()
+        self.cost_config_path = Path(config_file_path) if config_file_path else None
+        self.cost_config_mtime_ns = None
+        if self.cost_config_path is not None:
+            try:
+                self.cost_config_mtime_ns = self.cost_config_path.stat().st_mtime_ns
+            except OSError as exc:
+                self.get_logger().warning(
+                    f"MPC cost YAML hot reload is unavailable: {exc}"
+                )
 
         self.pin = pin
         self.crocoddyl = crocoddyl
@@ -378,6 +390,11 @@ class CrocoddylMPCNode(Node):
         self._diagnostic_start_monotonic = time.monotonic()
         self._open_diagnostic_log(urdf_path)
         self.create_timer(self.dt, self._solve_once)
+        if self.cost_config_path is not None:
+            self.create_timer(0.25, self._reload_cost_config_if_changed)
+            self.get_logger().info(
+                f"Watching MPC cost YAML for edits: {self.cost_config_path}"
+            )
         self.get_logger().info(
             "SE(3) dynamics MPC ready (%s, mode=%s): q_cmd=%s, teleop=%s, frame=%s"
             % (
@@ -835,6 +852,52 @@ class CrocoddylMPCNode(Node):
         x0 = self.xref.copy()
         problem = c.ShootingProblem(x0, running_models, terminal_model)
         return problem, c.SolverFDDP(problem)
+
+    def _reload_cost_config_if_changed(self) -> None:
+        """Apply edited cost settings without restarting the active MPC solver."""
+        if self.cost_config_path is None:
+            return
+        try:
+            modified_ns = self.cost_config_path.stat().st_mtime_ns
+            if modified_ns == self.cost_config_mtime_ns:
+                return
+            settings = load_runtime_cost_settings(self.cost_config_path)
+        except (OSError, ValueError) as exc:
+            self.get_logger().warning(
+                f"Could not reload MPC cost YAML; keeping the last valid costs: {exc}",
+                throttle_duration_sec=2.0,
+            )
+            return
+
+        effective_settings = dict(settings)
+        if self.control_mode == "joint":
+            effective_settings["nominal_posture"] = self.goal.tolist()
+        apply_runtime_cost_settings(
+            self.running_actions, self.terminal_action, effective_settings
+        )
+        if self.control_mode == "task_space":
+            self.nominal_posture = np.asarray(settings["nominal_posture"], dtype=float)
+        for parameter_name, action_name in (
+            ("se3_position_cost_weight", "se3_position"),
+            ("se3_orientation_cost_weight", "se3_orientation"),
+            ("posture_cost_weight", "posture"),
+            ("velocity_cost_weight", "velocity"),
+            ("torque_cost_weight", "torque"),
+            ("joint_limit_cost_weight", "joint_limit"),
+        ):
+            setattr(self, parameter_name, settings["weights"][action_name])
+        self.running_cost_weight = settings["running_cost_weight"]
+        self.terminal_cost_weight = settings["terminal_cost_weight"]
+        self.cost_config_mtime_ns = modified_ns
+        self.get_logger().info(
+            "Applied live MPC cost YAML update: "
+            f"position={self.se3_position_cost_weight:g}, "
+            f"orientation={self.se3_orientation_cost_weight:g}, "
+            f"posture={self.posture_cost_weight:g}, "
+            f"velocity={self.velocity_cost_weight:g}, "
+            f"torque={self.torque_cost_weight:g}, "
+            f"joint_limit={self.joint_limit_cost_weight:g}"
+        )
 
     def _cartesian_speed_limit(self, q: np.ndarray, displacement: np.ndarray) -> float:
         """Return the configured speed capped by the current Jacobian/qd limits."""

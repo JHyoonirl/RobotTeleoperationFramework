@@ -14,7 +14,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray
 from std_srvs.srv import SetBool
-from .safety import DOF, limit_joint_target, load_joint_limits, six
+from .safety import DOF, limit_joint_target, load_joint_limits, percent_ratio, six
 
 
 OP_IDLE = 5
@@ -60,8 +60,12 @@ class Indy7Dcp3Node(Node):
         self.max_joint_velocity = six(
             self.get_parameter("max_joint_velocity").value, "max_joint_velocity"
         )
-        self.velocity_ratio = float(self.get_parameter("velocity_ratio").value)
-        self.acceleration_ratio = float(self.get_parameter("acceleration_ratio").value)
+        self.velocity_ratio = percent_ratio(
+            self.get_parameter("velocity_ratio").value, "velocity_ratio"
+        )
+        self.acceleration_ratio = percent_ratio(
+            self.get_parameter("acceleration_ratio").value, "acceleration_ratio"
+        )
         if (
             self.period <= 0.0
             or not math.isfinite(self.period)
@@ -71,11 +75,8 @@ class Indy7Dcp3Node(Node):
             or not math.isfinite(self.deadman_timeout)
             or self.limit_margin < 0.0
             or not math.isfinite(self.limit_margin)
-            or not 0.0 < self.velocity_ratio <= 1.0
-            or not math.isfinite(self.acceleration_ratio)
-            or self.acceleration_ratio <= 0.0
         ):
-            raise ValueError("invalid DCP3 rate, timeout, limit, or motion ratio parameter")
+            raise ValueError("invalid DCP3 rate, timeout, or joint-limit margin")
 
         urdf = Path(get_package_share_directory("indy7_description")) / "urdf" / "indy7.urdf"
         self.lower, self.upper, urdf_velocity = load_joint_limits(urdf, self.joint_names)

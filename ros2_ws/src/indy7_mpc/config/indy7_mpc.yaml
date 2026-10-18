@@ -29,10 +29,10 @@ crocoddyl_mpc:
 
     # MPC cost weights: SE(3) tracking + posture + velocity + torque
     # + soft joint-limit avoidance.
-    se3_position_cost_weight: 3000.0
-    se3_orientation_cost_weight: 150.0
+    se3_position_cost_weight: 10000.0
+    se3_orientation_cost_weight: 1000.0
     posture_cost_weight: 0.05
-    velocity_cost_weight: 0.5
+    velocity_cost_weight: 0.05
     torque_cost_weight: 0.0001
     # Legacy key accepted by the node but unused by the dynamic predictor.
     acceleration_cost_weight: 0.05
@@ -62,8 +62,8 @@ crocoddyl_mpc:
 
     # Cartesian line-reference generator.  0.05 m/s is a conservative
     # starting value. Orientation is limited independently in rad/s.
-    cartesian_max_speed: 0.25
-    cartesian_max_angular_speed: 2.0
+    cartesian_max_speed: 0.5
+    cartesian_max_angular_speed: 3.0
     cartesian_speed_margin: 1.0
     cartesian_min_duration: 0.10
     cartesian_reference_topic: mpc/cartesian_reference_pose

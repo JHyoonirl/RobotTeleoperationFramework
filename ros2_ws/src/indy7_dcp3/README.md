@@ -5,6 +5,10 @@ feedback as `/joint_states` and forwards absolute joint positions from
 `/mpc/joint_position_cmd` in DCP3 `TELE_JOINT_ABSOLUTE` mode. MPC commands are radians; DCP3
 receives degrees.
 
+`velocity_ratio` and `acceleration_ratio` use DCP3's 0-100 scale: `20.0` means
+20%. The adapter validates both values and passes them unchanged to
+`movetelej_abs()`.
+
 The adapter starts disarmed. Arming requires fresh DCP3 feedback, a fresh MPC command, a
 continuously refreshed deadman, and the robot in IDLE. It checks the Indy7 URDF hard limits,
 keeps a 0.05 rad soft-limit margin, and caps each commanded joint-position update to the

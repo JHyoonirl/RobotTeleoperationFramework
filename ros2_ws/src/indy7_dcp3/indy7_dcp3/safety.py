@@ -13,6 +13,17 @@ import numpy as np
 DOF = 6
 
 
+def percent_ratio(value: Any, name: str) -> float:
+    """Validate a DCP3 motion ratio expressed on the 0-100 scale."""
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a finite number from 0 to 100") from exc
+    if not math.isfinite(ratio) or not 0.0 <= ratio <= 100.0:
+        raise ValueError(f"{name} must be a finite number from 0 to 100")
+    return ratio
+
+
 def six(values: Any, name: str) -> np.ndarray:
     result = np.asarray(values, dtype=float)
     if result.shape != (DOF,) or not np.all(np.isfinite(result)):

@@ -6,10 +6,11 @@ indy7_dcp3:
     deadman_topic: /indy7_dcp3/deadman
     arm_service: /indy7_dcp3/arm
     joint_names: [joint0, joint1, joint2, joint3, joint4, joint5]
-    publish_rate: 20.0
+    publish_rate: 200.0
     command_timeout: 0.30
     deadman_timeout: 0.30
     joint_limit_margin: 0.05
-    max_joint_velocity: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
-    velocity_ratio: 0.1
-    acceleration_ratio: 1.0
+    max_joint_velocity: [1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
+    # DCP3 motion ratios are sent as 0-100 values (20.0 means 20%).
+    velocity_ratio: 20.0
+    acceleration_ratio: 20.0

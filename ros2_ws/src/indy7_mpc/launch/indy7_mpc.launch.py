@@ -31,6 +31,7 @@ def generate_launch_description():
                 config_file,
                 {
                     "urdf_path": str(urdf),
+                    "config_file_path": config_file,
                     "simulate": simulate,
                     "initialize_target_from_current_state": initialize_target_from_current_state,
                     "diagnostic_log_directory": diagnostic_log_directory,

@@ -17,7 +17,7 @@ DOCKER_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
 DOCKER_DCP3_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
 	/workspace/ros2_ws/src/indy7_dcp3
 
-.PHONY: build build-hand test list run-mpc docker-build docker-build-dcp3 docker-build-gui docker-test docker-run docker-run-gui docker-build-hand docker-up-hand docker-down-hand docker-check-indy7 docker-up-indy7 docker-shell-indy7 docker-down-indy7
+.PHONY: build build-hand test list run-mpc docker-build docker-build-dcp3 docker-build-gui docker-test docker-run docker-run-gui docker-build-hand docker-up-hand docker-down-hand docker-check-indy7 docker-up-indy7 docker-shell-indy7 docker-down-indy7 docker-up-indy7-sim docker-shell-indy7-sim docker-launch-indy7-sim docker-keyboard-indy7-sim docker-down-indy7-sim
 
 build:
 	@test -f "$(ROS_SETUP)" || (echo "ROS 2 setup not found: $(ROS_SETUP)"; exit 1)
@@ -118,6 +118,63 @@ docker-shell-indy7:
 
 docker-down-indy7:
 	INDY7_ROBOT_IP="$${INDY7_ROBOT_IP:-127.0.0.1}" docker compose -f docker/compose.indy7.yaml down
+
+# Simulation-only workflow. The loopback IP satisfies Compose's required
+# DCP3 environment variable; the DCP3 service is never started by these targets.
+docker-up-indy7-sim:
+	@test -n "$$DISPLAY" || (echo "DISPLAY is not set; run this from a desktop session with X11 support"; exit 2)
+	@set -e; \
+		xauthority_file="$${XAUTHORITY:-$$HOME/.Xauthority}"; \
+		test -r "$$xauthority_file" || { echo "X11 authorization file is not readable: $$xauthority_file"; exit 2; }; \
+		if ! docker image inspect "$(DOCKER_IMAGE):mpc-gui" >/dev/null 2>&1; then \
+			$(MAKE) docker-build-gui DOCKER_IMAGE=$(DOCKER_IMAGE); \
+		fi; \
+		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc"; \
+		ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+		INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+		INDY7_ROBOT_IP=127.0.0.1 \
+		LOCAL_UID="$$(id -u)" LOCAL_GID="$$(id -g)" \
+		XAUTHORITY_FILE="$$xauthority_file" \
+		docker compose -f docker/compose.indy7.yaml up -d mpc; \
+		echo "Simulation MPC container is ready. DCP3 and hardware driver are not started."
+
+docker-shell-indy7-sim:
+	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+	INDY7_ROBOT_IP=127.0.0.1 \
+	docker compose -f docker/compose.indy7.yaml exec \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) mpc \
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(DOCKER_BASE_PATHS) -- bash
+
+docker-launch-indy7-sim:
+	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+	INDY7_ROBOT_IP=127.0.0.1 \
+	docker compose -f docker/compose.indy7.yaml exec \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) -e LIBGL_ALWAYS_SOFTWARE=1 mpc \
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(DOCKER_BASE_PATHS) -- bash -lc 'exec 9>/tmp/indy7_mpc_sim.lock; \
+		flock -n 9 || { echo "An Indy7 simulation launch is already active. Stop it before starting another." >&2; exit 2; }; \
+		exec ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true \
+		initialize_target_from_current_state:=true rviz:=true plot:=true \
+		diagnostic_log_directory:=/tmp/indy7_mpc_logs'
+
+docker-keyboard-indy7-sim:
+	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+	INDY7_ROBOT_IP=127.0.0.1 \
+	docker compose -f docker/compose.indy7.yaml exec \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) mpc \
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(DOCKER_BASE_PATHS) -- ros2 run indy7_mpc keyboard_teleop --ros-args \
+		-p initialize_from_current_pose:=true
+
+docker-down-indy7-sim:
+	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+	INDY7_ROBOT_IP=127.0.0.1 \
+	docker compose -f docker/compose.indy7.yaml stop mpc
 
 docker-run-gui:
 	@test -n "$$DISPLAY" || { echo "DISPLAY is not set; run this from an X11 desktop session"; exit 1; }
