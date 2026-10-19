@@ -24,15 +24,15 @@ crocoddyl_mpc:
 
     # MPC discretization and solver budget.
     horizon: 20
-    dt: 0.005
-    max_solver_iterations: 10
+    dt: 0.005  # 200 Hz, matching ros2_control and DCP3 feedback/commands.
+    max_solver_iterations: 7
 
     # MPC cost weights: SE(3) tracking + posture + velocity + torque
     # + soft joint-limit avoidance.
     se3_position_cost_weight: 10000.0
     se3_orientation_cost_weight: 1000.0
     posture_cost_weight: 0.05
-    velocity_cost_weight: 0.05
+    velocity_cost_weight: 0.25
     torque_cost_weight: 0.0001
     # Legacy key accepted by the node but unused by the dynamic predictor.
     acceleration_cost_weight: 0.05
@@ -66,6 +66,9 @@ crocoddyl_mpc:
     cartesian_max_angular_speed: 3.0
     cartesian_speed_margin: 1.0
     cartesian_min_duration: 0.10
+    # Maximum TCP distance from the start-goal segment [m] (5 mm).
+    # Applied after joint clipping, including the joint-linear step between commands.
+    cartesian_path_tolerance: 0.005
     cartesian_reference_topic: mpc/cartesian_reference_pose
 
     # Preview-only simulation stabilizers; they are not hardware parameters.
@@ -77,9 +80,9 @@ crocoddyl_mpc:
     # Empty means ros2_ws/logs/indy7_mpc/<UTC run>/.
     diagnostic_log_directory: ""
     diagnostic_flush_period: 1.0
-    diagnostic_log_prediction: true
+    diagnostic_log_prediction: false
 
     # The q_cmd boundary below enforces position, velocity and increment limits.
-    # Dynamics predictions are only rejected when they are non-finite.
+    # The Cartesian path guard additionally limits task-space commands.
     stationary_hold_position_tolerance: 0.002
     stationary_hold_orientation_tolerance: 0.01

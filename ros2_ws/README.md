@@ -100,12 +100,26 @@ MPC의 tracking residual은 Pinocchio forward kinematics로 매 stage 계산된�
 `joint_state_broadcaster` 및 `forward_position_controller`가 활성화된다.
 MPC는 매 주기 `mpc/joint_position_cmd`에 `Float64MultiArray([q0..q5])`를
 발행하며 launch에서 `/forward_position_controller/commands`로 remap한다.
+MPC `dt: 0.005`, ros2_control `update_rate: 200`, DCP3 `publish_rate: 200.0`으로
+제어·피드백 주기 설정을 모두 200 Hz로 맞춘다. Mock 하드웨어의 `calculate_dynamics`를
+켜서 위치 명령의 실제 반영 차분으로 관절 속도를 계산하고 `/joint_states`에 발행한다.
+실기에서는 DCP3가 제공하는 실제 `qdot`을 사용한다.
+200 Hz는 설정 목표 주기이며 Python MPC 계산이 5 ms를 넘으면 실제 최적화 빈도는
+낮아진다. 이동 중 `solver.solve_time_ms`와 연속 `elapsed_s` 차이로 실제 주기를
+확인한다. 실기 DCP3 루프의 실제 주기는 제어기 RPC 지연에도 영향을 받는다.
+MPC의 관절 상태 구독과 관절 명령 발행은 깊이 1로 최신 값만 유지한다.
+계산이 5 ms를 넘을 때 과거 상태가 큐에 누적되어 지연된 보정을 반복하지 않도록 한다.
+Mock 위치 서보의 속도는 MPC가 실제 수신한 위치·타임스탬프 간격으로 재계산하고,
+시정수 `2*dt`(현재 10 ms)로 평활화한다. 실기의 실제 속도 피드백에는 이 처리를 적용하지 않는다.
+시뮬레이션에서 목표 위치·방향이 `stationary_hold_position_tolerance`와
+`stationary_hold_orientation_tolerance`(현재 2 mm, 0.01 rad) 안에 들어오면 해당 관절
+위치를 유지한다. 새 목표 입력이 오면 최적화를 재개한다. 실기는 기존의 솔버 정지 판정을 유지한다.
 Task-space 목표는 horizon의 모든 단계에서 같은 최종 pose를 추적하지 않고,
 현재 TCP에서 최종 목표까지의 직선 위치 기준과 SO(3) 방향 보간 기준으로
 분해된다. 코드 parameter 기본값은 `cartesian_max_speed=0.05 m/s`,
 `cartesian_max_angular_speed=0.75 rad/s`, `cartesian_speed_margin=0.5`지만,
 실행 시 읽는 [`indy7_mpc.yaml`](src/indy7_mpc/config/indy7_mpc.yaml)이 이를
-덮어쓴다. 현재 YAML은 각각 `0.25 m/s`, `2.0 rad/s`, `1.0`으로 설정되어 있다.
+덮어쓴다. 현재 YAML은 각각 `0.5 m/s`, `3.0 rad/s`, `1.0`으로 설정되어 있다.
 실제 Cartesian 선속도 기준은 이 상한과 현재 방향의 Jacobian/URDF joint-velocity
 제한으로 계산한 값 중 작은 값이다. `cartesian_reference_topic`에서 현재 horizon 첫 번째 기준 pose를
 확인할 수 있다.
@@ -119,6 +133,8 @@ hard·soft joint-limit 여유, raw torque와 ABA 동역학 항, cost 항, solver
 singular value/condition number, 월드 Z 회전에 필요한 추정 qdot, teleop pose 갱신 주기와
 목표 각속도, joint-state age, 전체 예측 `xs/us`를 포함한다.
 같은 디렉터리의 `parameters.json`은 해당 실행의 파라미터 snapshot이다.
+`state_input.age_s`는 콜백 수신 이후 시간이며, `state_input.message_age_s`는
+ROS 타임스탬프 기준 메시지 생성 이후 시간이므로 큐 지연까지 포함한다.
 기록을 끄거나 저장 위치를 바꾸려면 YAML의 `diagnostic_logging`,
 `diagnostic_log_directory`, `diagnostic_log_prediction`을 수정한다.
 `--rm`으로 컨테이너를 제거하면 컨테이너 내부 로그도 함께 사라지므로 보존하려면
@@ -167,18 +183,17 @@ docker exec robot-teleoperation bash -lc \
 현재 적용 중인 Cartesian 속도 관련 YAML 파라미터는 다음과 같다.
 
 ```yaml
-cartesian_max_speed: 0.25         # m/s, 직선 이동 기준 상한
-cartesian_max_angular_speed: 2.0  # rad/s, orientation 상한
+cartesian_max_speed: 0.5          # m/s, 직선 이동 기준 상한
+cartesian_max_angular_speed: 3.0  # rad/s, orientation 상한
 cartesian_speed_margin: 1.0       # Jacobian 제한 계산에 적용할 URDF 속도 비율
 cartesian_min_duration: 0.10    # 너무 짧은 목표 이동 방지 [s]
 ```
 
 `cartesian_max_speed`는 계획 기준의 상한이지 측정 TCP가 그 속도로 움직인다는 보장은
-아니다. 실제 선속도는 Jacobian 제한, MPC의 관절 명령 필터, 실기 DCP3 adapter의 별도
-관절별 변화 제한에도 영향을 받는다. 특히 현재 [`indy7_dcp3.yaml`](src/indy7_dcp3/config/indy7_dcp3.yaml)의
-`max_joint_velocity`는 각 관절 `0.05 rad/s`다. 이것은 TCP 선속도 단위가 아니며,
-Cartesian 속도 상한과 서로 바꿔 쓸 수 없다. 이 하드웨어 제한을 올리는 일은 제조사 및
-실험실 안전 조건을 확인한 별도 검증 후에만 고려한다.
+아니다. 실제 선속도는 Jacobian 제한, MPC의 관절 명령 필터, DCP3의 속도·가속도
+비율에도 영향을 받는다. DCP3 adapter의 `max_joint_velocity`와 주기별 목표값
+커팅은 제거했다. [`indy7_dcp3.yaml`](src/indy7_dcp3/config/indy7_dcp3.yaml)의
+`velocity_ratio`와 `acceleration_ratio`는 각각 20%이며 TCP 선속도 단위가 아니다.
 
 끝단 선속도를 더 높이는 실험은 먼저 시뮬레이션에서 확인하고, 실기에서는 작업공간을
 비운 뒤 물리 E-stop에 손이 닿는 상태에서 작은 직선 이동으로 한 설정만 단계적으로
@@ -187,12 +202,36 @@ Cartesian 속도 상한과 서로 바꿔 쓸 수 없다. 이 하드웨어 제한
 colcon 재빌드가 필요 없다. `cartesian_path.speed_limit_m_s`는 Jacobian 제한까지 반영한
 계획 속도 상한이며 측정 속도 자체는 아니다. 실제 응답은 연속된 `/mpc/current_pose` 또는
 진단 로그의 현재 pose/time을 비교해 확인한다. 속도 실험 중에는 orientation 상한이나
-DCP3 `max_joint_velocity`를 동시에 변경하지 않는다.
+DCP3 속도·가속도 비율을 동시에 변경하지 않는다.
 
 특이점 근처에서는 계획 속도가 자동으로 낮아질 수 있다. teleoperation pose가 연속해서
 들어오는 동안에는 path 시작점을 매번 재설정하지 않고, 현재 line의 목표점만
 갱신한다. 진단 JSONL의 `cartesian_path`에 start/goal/reference horizon,
 적용 선속도·각속도 제한, 진행률, line 기준 편차가 기록된다.
+
+Task-space 모드에서는 `cartesian_path_tolerance: 0.005` [m]로 TCP의
+시작점–목표점 **선분까지의 최단거리**를 5 mm 이내로 제한한다. 시간별
+기준점에 늦게 도착해도 선분 위라면 경로 편차는 0이다. 위치 이동 없이
+회전만 할 때에는 고정 위치를 중심으로 같은 반경을 적용한다.
+MPC의 running/terminal 비용에 `cartesian_path` 항(가중치 `1/tolerance²`)을
+추가하고, 관절 제한을 적용한 최종 q_cmd에는 별도 경로 검사를 적용한다.
+경계 근처의 명령은 Jacobian으로 경로 안쪽에 보정하되 관절 위치·속도·증분
+제한을 유지한다. 관절 직선 보간 중의 TCP 곡률 상한까지 검사하여 허용 범위에 들어올 때까지
+명령 증분을 절반씩 줄이며, 적합한 증분이 없거나 실측 TCP가 이미 범위를
+벗어났으면 현재 관절 위치를 유지한다. 이때 자동으로 직선을 재설정하지 않는다.
+동일 목표의 반복 수신도 직선을 재설정하지 않으며, 변경된 목표의 선분이
+현재 TCP를 허용 범위 안에 포함하지 못하면 현재 실측 TCP에서 새 이동을 시작한다.
+진단 `cartesian_path`의 `deviation_m`, `tolerance_m`, `command_scale`, `guard`로
+실측 편차와 제한 동작을 확인한다. `cartesian_path_limited`는 보정/축소,
+`cartesian_path_hold`는 가능한 증분이 없어 유지, `cartesian_path_violation`은
+실측 편차 초과를 뜻한다. `/mpc/solver_success`는 솔버의 수렴 여부이며,
+`/mpc/status` (`std_msgs/String`)는 경로 제한·유지·편차 초과와 솔버 상태를
+구분한다. Plot은 경로 보정 동작을 `PATH LIMITED`로 표시하며 솔버 실패로
+취급하지 않는다. 수렴하지 않은 경우도 목표 도달 불가 판정과는 다르다.
+이 검사는 URDF 운동학과 관절 직선 보간에 대한 소프트웨어 제한이다.
+실제 로봇의 추종 오차, 하위 드라이버의 별도 관절 필터 및 보간 동작은
+포함하지 않으므로 실제 TCP의 5 mm 보장은 실측 검증이 필요하다.
+허용 편차 변경은 YAML 수정 후 노드를 재시작해야 적용된다.
 
 키보드로 desired TCP pose를 조작하려면 MPC를 실행한 터미널과 별도의 터미널에서 다음을 실행한다.
 
@@ -258,7 +297,7 @@ docker run --rm --net=host --ipc=host \
 기본 목적함수는 다음과 같다.
 
 ```text
-J = J_SE3 + J_posture + J_velocity + J_torque + J_joint_limit
+J = J_SE3 + J_cartesian_path + J_posture + J_velocity + J_torque + J_joint_limit
 ```
 
 위치/자세 weight는 각각 `20.0/5.0`, posture `0.1`, velocity `1.0`,
@@ -411,9 +450,8 @@ ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"
 make docker-down-indy7
 ```
 
-현재 MPC YAML의 `cartesian_max_speed`는 `0.25 m/s`이고, 실기 DCP3 YAML의 관절별
-`max_joint_velocity`는 `0.05 rad/s`다. 전자는 계획된 TCP 직선 이동 상한, 후자는 관절
-setpoint 변화 제한으로 서로 다른 제약이다. 속도를 높이는 실험은 `cartesian_max_speed`만
-한 번에 한 단계 조정하고, 실제 TCP 응답과 진단 로그를 확인한다. DCP3 관절 제한을 올리는
-것은 별도 안전 검토 없이 하지 않는다. 모든 software limit/watchdog은 안전 정격이 아니며,
+현재 MPC YAML의 `cartesian_max_speed`는 `0.5 m/s`이고, DCP3 피드백·명령 주기는
+200 Hz 설정이다. DCP3의 추가 관절 속도 커팅은 제거했으며 속도·가속도 비율 20%는 유지한다.
+속도를 높이는 실험은 `cartesian_max_speed`만 한 번에 한 단계 조정하고,
+실제 TCP 응답과 진단 로그를 확인한다. 모든 software limit/watchdog은 안전 정격이 아니며,
 물리 E-stop, 충돌 감시, 작업공간 감시를 대체하지 않는다.

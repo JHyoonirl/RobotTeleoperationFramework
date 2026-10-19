@@ -11,8 +11,8 @@ receives degrees.
 
 The adapter starts disarmed. Arming requires fresh DCP3 feedback, a fresh MPC command, a
 continuously refreshed deadman, and the robot in IDLE. It checks the Indy7 URDF hard limits,
-keeps a 0.05 rad soft-limit margin, and caps each commanded joint-position update to the
-equivalent of 0.05 rad/s at the configured publish rate by default. A stale
+keeps a 0.05 rad soft-limit margin, and forwards validated joint targets unchanged at
+200 Hz. The adapter does not apply an additional per-cycle joint velocity clip. A stale
 command/deadman or invalid target stops teleoperation and requires a new arm request.
 
 These software checks are not safety-rated. They do not provide collision monitoring, workspace
@@ -150,13 +150,16 @@ ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"
 Stop each manually launched ROS process with `Ctrl+C`, then remove the idle containers with
 `make docker-down-indy7`.
 
-For the planned TCP speed test, the current MPC YAML has `cartesian_max_speed: 0.25` m/s and
-`cartesian_max_angular_speed: 2.0` rad/s. The DCP3 YAML independently caps joint target changes at
-`max_joint_velocity: 0.05` rad/s per joint. The MPC value limits the planned Cartesian path; it is
-not a measured TCP speed guarantee, and the adapter's joint cap is not a TCP speed. Start by
+The MPC, ros2_control simulation, and DCP3 feedback/command loop are configured at 200 Hz
+(`dt: 0.005`, `update_rate: 200`, `publish_rate: 200.0`). The current MPC YAML has
+`cartesian_max_speed: 0.5` m/s and `cartesian_max_angular_speed: 3.0` rad/s.
+The adapter's `max_joint_velocity` setting and per-cycle clipping have been removed;
+joint speed/increment limits remain in the MPC. DCP3's `velocity_ratio: 20.0` and
+`acceleration_ratio: 20.0` remain active. The Cartesian limit is a planned reference,
+not a measured TCP speed guarantee. Start by
 changing only `cartesian_max_speed` in the host-mounted YAML, validate in simulation, then restart
 MPC and measure the actual TCP response. This source/config edit does not require rebuilding the
-Docker image. Do not raise the DCP3 joint cap without a separate safety review.
+Docker image.
 
 The adapter uses the IndyDCP3 mode and operation-state conventions from Neuromeka's
 [official Indy ROS 2 driver](https://github.com/neuromeka-robotics/indy-ros2/tree/jazzy-indyDCP3).

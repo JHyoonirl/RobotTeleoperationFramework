@@ -10,7 +10,6 @@ indy7_dcp3:
     command_timeout: 0.30
     deadman_timeout: 0.30
     joint_limit_margin: 0.05
-    max_joint_velocity: [1.5, 1.5, 1.5, 1.5, 1.5, 1.5]
     # DCP3 motion ratios are sent as 0-100 values (20.0 means 20%).
     velocity_ratio: 20.0
     acceleration_ratio: 20.0

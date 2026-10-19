@@ -489,12 +489,14 @@ deadman publisher는 실행 중인 채로 두고, 별도 DCP3 shell에서만 arm
 `source`나 `colcon build`를 반복하지 않습니다. 소스는 `/workspace`에 read-only bind mount되어
 있어 편집은 호스트에서 하고, Python/launch/YAML 변경은 관련 노드를 재시작하면 반영됩니다.
 
-내일 끝단 선속도 실험을 위해 현재 설정을 기록합니다. MPC YAML의 `cartesian_max_speed`는
-`0.25 m/s`, `cartesian_max_angular_speed`는 `2.0 rad/s`이고, DCP3 YAML의 관절별
-`max_joint_velocity`는 `0.05 rad/s`입니다. MPC 값은 Cartesian 계획 상한이고 DCP3 값은
-관절 setpoint 제한이므로 같은 속도 개념이 아닙니다. 먼저 시뮬레이션에서 확인하고,
+MPC, ros2_control 시뮬레이션, DCP3 피드백/명령 주기 설정은 모두 200 Hz(5 ms)입니다.
+시뮬레이션은 `calculate_dynamics: true`로 위치 변화에 따른 관절 속도를 계산합니다.
+MPC YAML의 `cartesian_max_speed`는 `0.5 m/s`, `cartesian_max_angular_speed`는
+`3.0 rad/s`입니다. DCP3의 `max_joint_velocity` 파라미터와 주기별 목표 커팅은
+제거했으며, MPC의 관절 속도·증분 제한과 DCP3 속도·가속도 비율 20%는 적용됩니다.
+먼저 시뮬레이션에서 확인하고,
 실기에서는 `cartesian_max_speed`만 보수적으로 한 단계씩 바꿔 작은 직선 동작으로 검증합니다.
-DCP3 제한을 함께 올리지 말고, 계획 상한과 실제 TCP 응답을 구분해 진단 로그에서 확인합니다.
+계획 상한과 실제 TCP 응답을 구분해 진단 로그에서 확인합니다.
 YAML 수정은 호스트 소스에 바로 반영되므로 이미지 재빌드 없이 MPC를 재시작하면 됩니다.
 
 이 adapter는 충돌/작업공간 감시나 안전 정격 E-stop이 아닙니다. 첫 테스트는 낮은 속도,

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from .cartesian_path import segment_error
+
 
 class SE3DynamicActionModel:
     """Factory for a Python Crocoddyl differential action model."""
@@ -27,6 +29,7 @@ class SE3DynamicActionModel:
         terminal=False,
         joint_limit_margin=0.2,
         torque_limits=None,
+        path_tolerance=None,
     ):
         class _ActionModel(crocoddyl.DifferentialActionModelAbstract):
             def __init__(self):
@@ -35,6 +38,13 @@ class SE3DynamicActionModel:
                 self.model = model
                 self.frame_id = int(frame_id)
                 self.target = target.copy()
+                self.path_start = target.translation.copy()
+                self.path_goal = target.translation.copy()
+                if path_tolerance is not None and (
+                    not np.isfinite(path_tolerance) or path_tolerance <= 0.0
+                ):
+                    raise ValueError("path_tolerance must be positive and finite")
+                self.path_weight = 0.0 if path_tolerance is None else 1.0 / path_tolerance**2
                 self.nominal_posture = np.asarray(nominal_posture, dtype=float).copy()
                 self.weights = {name: float(value) for name, value in weights.items()}
                 self.terminal_scale = float(terminal_scale)
@@ -65,6 +75,7 @@ class SE3DynamicActionModel:
                 self.u_ub = self.torque_limits
                 self.cost_names = (
                     "se3_tracking",
+                    "cartesian_path",
                     "posture",
                     "velocity",
                     "torque",
@@ -74,6 +85,17 @@ class SE3DynamicActionModel:
 
             def update_target(self, target):
                 self.target = target.copy()
+
+            def update_path(self, start, goal):
+                self.path_start = np.asarray(start, dtype=float).copy()
+                self.path_goal = np.asarray(goal, dtype=float).copy()
+
+            def _path_error(self):
+                return segment_error(
+                    self.pin_data.oMf[self.frame_id].translation,
+                    self.path_start,
+                    self.path_goal,
+                )
 
             def _pose_error(self, q):
                 self.pin.forwardKinematics(self.model, self.pin_data, q)
@@ -139,6 +161,10 @@ class SE3DynamicActionModel:
                     * float(torque @ torque),
                 }
                 terms["joint_limit"] = self.terminal_scale * self._joint_limit_terms(q)[0]
+                path_error, _ = self._path_error()
+                terms["cartesian_path"] = (
+                    scale * 0.5 * self.path_weight * float(path_error @ path_error)
+                )
                 return terms, pose_error
 
             def cost_terms(self, x, u):
@@ -219,6 +245,17 @@ class SE3DynamicActionModel:
                 )
                 data.Lxx[: self.nq, : self.nq] += orientation_weight * (
                     orientation_jacobian.T @ orientation_jacobian
+                )
+
+                path_error, projection = self._path_error()
+                world_position_jacobian = (
+                    -self.pin_data.oMf[self.frame_id].rotation @ position_jacobian
+                )
+                path_jacobian = projection @ world_position_jacobian
+                path_weight = scale * self.path_weight
+                data.Lx[: self.nq] += path_weight * path_jacobian.T @ path_error
+                data.Lxx[: self.nq, : self.nq] += path_weight * (
+                    path_jacobian.T @ path_jacobian
                 )
 
                 posture_weight = self.terminal_scale * self.weights["posture"]

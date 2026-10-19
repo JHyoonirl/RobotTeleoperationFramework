@@ -249,6 +249,7 @@
   <ros2_control name="indy" type="system">
     <hardware>
       <plugin>mock_components/GenericSystem</plugin>
+      <param name="calculate_dynamics">true</param>
       <param name="state_following_offset">0.0</param>
     </hardware>
     <joint name="joint0">

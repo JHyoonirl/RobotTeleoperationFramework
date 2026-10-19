@@ -21,8 +21,9 @@ from geometry_msgs.msg import PoseStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64, Float64MultiArray
+from std_msgs.msg import Float64, Float64MultiArray, String
 
+from .cartesian_path import limit_cartesian_step, project_cartesian_command, segment_error
 from .mpc_cost_config import apply_runtime_cost_settings, load_runtime_cost_settings
 from .se3_dynamic_model import SE3DynamicActionModel
 
@@ -46,7 +47,7 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("goal_position", [0.555628, -0.028394, 0.500983])
         self.declare_parameter("goal_orientation_xyzw", [-0.019703, 0.987570, 0.119061, 0.100709])
         self.declare_parameter("horizon", 20)
-        self.declare_parameter("dt", 0.02)
+        self.declare_parameter("dt", 0.005)
         self.declare_parameter("max_solver_iterations", 10)
         self.declare_parameter("simulate", False)
         self.declare_parameter("initialize_target_from_current_state", False)
@@ -61,6 +62,7 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("cartesian_max_angular_speed", 0.75)
         self.declare_parameter("cartesian_speed_margin", 0.5)
         self.declare_parameter("cartesian_min_duration", 0.10)
+        self.declare_parameter("cartesian_path_tolerance", 0.005)
         self.declare_parameter(
             "cartesian_reference_topic", "mpc/cartesian_reference_pose"
         )
@@ -165,6 +167,9 @@ class CrocoddylMPCNode(Node):
         )
         self.cartesian_min_duration = float(
             self.get_parameter("cartesian_min_duration").value
+        )
+        self.cartesian_path_tolerance = float(
+            self.get_parameter("cartesian_path_tolerance").value
         )
         self.cartesian_reference_topic = str(
             self.get_parameter("cartesian_reference_topic").value
@@ -274,6 +279,18 @@ class CrocoddylMPCNode(Node):
             )
         if not np.all(np.isfinite(cost_weights)) or any(weight <= 0.0 for weight in cost_weights):
             raise ValueError("cost weight는 모두 양수인 유한값이어야 합니다.")
+        if not np.isfinite(self.cartesian_path_tolerance) or self.cartesian_path_tolerance <= 0.0:
+            raise ValueError("cartesian_path_tolerance은 양수인 유한값이어야 합니다 [m].")
+        # The continuous command-step bound assumes bounded revolute joints.
+        if self.control_mode == "task_space" and any(
+            not joint.shortname().startswith("JointModelR") or joint.nq != 1 or joint.nv != 1
+            for joint in list(self.model.joints)[1:]
+        ):
+            raise ValueError("Cartesian path guard requires bounded revolute joints")
+        self.cartesian_reach_bound = sum(
+            float(np.linalg.norm(placement.translation))
+            for placement in self.model.jointPlacements
+        ) + float(np.linalg.norm(self.model.frames[self.frame_id].placement.translation))
         if self.simulation_damping < 0.0 or not np.isfinite(self.simulation_damping):
             raise ValueError("simulation_damping은 0 이상인 유한값이어야 합니다.")
         if not 0.0 < self.simulation_acceleration_smoothing <= 1.0:
@@ -314,6 +331,8 @@ class CrocoddylMPCNode(Node):
         self.cartesian_path_speed = self.cartesian_max_speed
         self.cartesian_path_progress = 0.0
         self.cartesian_path_deviation = 0.0
+        self.cartesian_command_scale = 1.0
+        self.cartesian_path_guard = ""
         self.cartesian_path_initialized_from_state = False
         self.cartesian_reference_poses = [
             self.target_pose.copy() for _ in range(self.horizon + 1)
@@ -342,7 +361,8 @@ class CrocoddylMPCNode(Node):
         self.stationary_hold_cost = float("nan")
 
         # Both ros2_control simulation and the real driver expose joint_states.
-        self.create_subscription(JointState, "joint_states", self._on_joint_state, 10)
+        # A solve can exceed dt; queued feedback would make the controller chase old states.
+        self.create_subscription(JointState, "joint_states", self._on_joint_state, 1)
         self.state_pub = (
             self.create_publisher(JointState, "joint_states", 10)
             if self.internal_simulation
@@ -353,7 +373,7 @@ class CrocoddylMPCNode(Node):
             PoseStamped, self.cartesian_reference_topic, 10
         )
         self.joint_command_pub = self.create_publisher(
-            Float64MultiArray, self.joint_command_topic, 10
+            Float64MultiArray, self.joint_command_topic, 1
         )
         self.desired_pose_pub = self.create_publisher(PoseStamped, "mpc/desired_pose", 10)
         self.current_pose_pub = self.create_publisher(PoseStamped, "mpc/current_pose", 10)
@@ -367,11 +387,13 @@ class CrocoddylMPCNode(Node):
         self.solve_time_pub = self.create_publisher(Float64, "mpc/solve_time_ms", 10)
         self.solve_iterations_pub = self.create_publisher(Float64, "mpc/solver_iterations", 10)
         self.solve_success_pub = self.create_publisher(Float64, "mpc/solver_success", 10)
+        self.status_pub = self.create_publisher(String, "mpc/status", 10)
         self.control_norm_pub = self.create_publisher(Float64, "mpc/control_norm", 10)
         self.cost_term_pubs = {
             name: self.create_publisher(Float64, f"mpc/cost/{name}", 10)
             for name in (
                 "se3_tracking",
+                "cartesian_path",
                 "posture",
                 "velocity",
                 "torque",
@@ -475,6 +497,7 @@ class CrocoddylMPCNode(Node):
                 "cartesian_max_angular_speed",
                 "cartesian_speed_margin",
                 "cartesian_min_duration",
+                "cartesian_path_tolerance",
                 "cartesian_reference_topic",
                 "se3_position_cost_weight",
                 "se3_orientation_cost_weight",
@@ -657,6 +680,10 @@ class CrocoddylMPCNode(Node):
                     if np.isfinite(self.last_state_update_monotonic)
                     else float("nan"),
                     "message_stamp_s": self.last_state_stamp_s,
+                    "message_age_s": self.get_clock().now().nanoseconds * 1.0e-9
+                    - self.last_state_stamp_s
+                    if np.isfinite(self.last_state_stamp_s)
+                    else float("nan"),
                 },
                 "target_pose": self._pose_record(target),
                 "target_input": {
@@ -683,6 +710,9 @@ class CrocoddylMPCNode(Node):
                     "duration_s": self.cartesian_path_duration,
                     "progress": self.cartesian_path_progress,
                     "deviation_m": self.cartesian_path_deviation,
+                    "tolerance_m": self.cartesian_path_tolerance,
+                    "command_scale": self.cartesian_command_scale,
+                    "guard": self.cartesian_path_guard,
                 },
                 "pose_error_local": pose_error,
                 "position_error_world": np.asarray(target.translation - current_pose.translation),
@@ -830,6 +860,8 @@ class CrocoddylMPCNode(Node):
                 terminal_scale=self.running_cost_weight,
                 joint_limit_margin=self.joint_limit_margin,
                 torque_limits=self.torque_limits,
+                path_tolerance=self.cartesian_path_tolerance
+                if self.control_mode == "task_space" else None,
             )
             self.running_actions.append(action)
             running_models.append(c.IntegratedActionModelEuler(action, self.dt))
@@ -846,6 +878,8 @@ class CrocoddylMPCNode(Node):
             terminal_scale=self.terminal_cost_weight,
             joint_limit_margin=self.joint_limit_margin,
             torque_limits=self.torque_limits,
+            path_tolerance=self.cartesian_path_tolerance
+            if self.control_mode == "task_space" else None,
             terminal=True,
         )
         terminal_model = c.IntegratedActionModelEuler(self.terminal_action, 0.0)
@@ -981,17 +1015,24 @@ class CrocoddylMPCNode(Node):
             ]
             current_pose = self._tcp_pose(q)
             self.cartesian_path_deviation = float(
-                np.linalg.norm(
-                    current_pose.translation
-                    - self.cartesian_reference_poses[0].translation
-                )
+                np.linalg.norm(segment_error(
+                    current_pose.translation,
+                    self.cartesian_path_start_pose.translation,
+                    self.target_pose.translation,
+                )[0])
             )
 
         for action, reference_pose in zip(
             self.running_actions, self.cartesian_reference_poses[:-1]
         ):
             action.update_target(reference_pose)
+            action.update_path(
+                self.cartesian_path_start_pose.translation, self.target_pose.translation
+            )
         self.terminal_action.update_target(self.cartesian_reference_poses[-1])
+        self.terminal_action.update_path(
+            self.cartesian_path_start_pose.translation, self.target_pose.translation
+        )
 
     def _on_target_pose(self, message: PoseStamped) -> None:
         if message.header.frame_id and message.header.frame_id != self.pose_frame:
@@ -1024,12 +1065,24 @@ class CrocoddylMPCNode(Node):
             return
         new_target = self.pin.SE3(self.pin.Quaternion(orientation).matrix(), position)
         update_now = time.monotonic()
-        # Keep one path anchor while teleoperation updates the goal.  Once the
-        # previous line is complete, begin the next line at the measured TCP.
-        if update_now - self.cartesian_path_start_time >= self.cartesian_path_duration:
+        # Repeated identical targets must not reset a line while tracking lags.
+        if (
+            not np.allclose(new_target.translation, self.target_pose.translation, rtol=0.0, atol=1e-12)
+            or np.linalg.norm(self.pin.log3(self.target_pose.rotation.T @ new_target.rotation)) > 1e-12
+        ):
             seed = self.latest_state[: self.model.nq] if self.latest_state is not None else self.sim_q
-            self.cartesian_path_start_pose = self._tcp_pose(seed).copy()
-            self.cartesian_path_start_time = update_now
+            current_pose = self._tcp_pose(seed).copy()
+            new_deviation = np.linalg.norm(segment_error(
+                current_pose.translation,
+                self.cartesian_path_start_pose.translation,
+                new_target.translation,
+            )[0])
+            if (
+                update_now - self.cartesian_path_start_time >= self.cartesian_path_duration
+                or new_deviation > self.cartesian_path_tolerance
+            ):
+                self.cartesian_path_start_pose = current_pose
+                self.cartesian_path_start_time = update_now
         target_dt = update_now - self.last_target_update_monotonic
         if self.previous_target_pose is not None and target_dt > 0.0:
             delta_local = self.pin.log3(
@@ -1104,12 +1157,23 @@ class CrocoddylMPCNode(Node):
             return
         if not np.all(np.isfinite(position)) or not np.all(np.isfinite(velocity)):
             return
-        self.latest_state = np.r_[position, velocity]
-        self.last_state_update_monotonic = time.monotonic()
-        self.last_state_stamp_s = (
+        state_stamp_s = (
             float(message.header.stamp.sec)
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
+        if self.simulate and not self.internal_simulation and self.latest_state is not None:
+            elapsed = state_stamp_s - self.last_state_stamp_s
+            if elapsed > 1.0e-6:
+                # Average the mock servo's position jumps across the samples we actually consume.
+                observed_velocity = (position - self.latest_state[: self.model.nq]) / elapsed
+                alpha = elapsed / (elapsed + 2.0 * self.dt)
+                velocity = (
+                    alpha * observed_velocity
+                    + (1.0 - alpha) * self.latest_state[self.model.nq :]
+                )
+        self.latest_state = np.r_[position, velocity]
+        self.last_state_update_monotonic = time.monotonic()
+        self.last_state_stamp_s = state_stamp_s
         if not self.initial_target_state_initialized:
             current_pose = self._tcp_pose(position).copy()
             self.target_pose = current_pose
@@ -1163,10 +1227,13 @@ class CrocoddylMPCNode(Node):
 
     def _publish_stationary_hold(self, state: np.ndarray) -> None:
         """Keep the last command without invoking FDDP again."""
-        if self.last_q_cmd is not None and np.all(np.isfinite(self.last_q_cmd)):
-            q_cmd = self._safe_joint_command(self.last_q_cmd, state)
+        if self.stationary_hold_q is not None and np.all(np.isfinite(self.stationary_hold_q)):
+            q_cmd = self._safe_joint_command(self.stationary_hold_q, state)
         else:
             q_cmd = self._safe_joint_command(state[: self.model.nq], state)
+        guard_success = not bool(self.cartesian_path_guard)
+        if not guard_success:
+            self.stationary_hold_active = False
         current_pose = self._tcp_pose(state[: self.model.nq]).copy()
         pose_error = self._pose_error(state[: self.model.nq], self.target_pose, self.pose_data)
         self.last_q_cmd = q_cmd.copy()
@@ -1175,7 +1242,11 @@ class CrocoddylMPCNode(Node):
         self.solve_time_pub.publish(Float64(data=0.0))
         self.solve_iterations_pub.publish(Float64(data=0.0))
         self.solve_success_pub.publish(Float64(data=1.0))
+        self.status_pub.publish(String(data=self.cartesian_path_guard or "stationary_hold"))
         self.control_norm_pub.publish(Float64(data=0.0))
+        self.task_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error))))
+        self.position_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error[:3]))))
+        self.orientation_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error[3:]))))
         self._publish_joint_command(q_cmd)
         self._publish_target_pose()
         self._publish_pose(self.cartesian_reference_pub, self.cartesian_reference_poses[0])
@@ -1183,7 +1254,7 @@ class CrocoddylMPCNode(Node):
         self._publish_qref()
         self.solve_count += 1
         self._write_diagnostic(
-            status="stationary_hold",
+            status=self.cartesian_path_guard or "stationary_hold",
             state=state,
             target=self.target_pose,
             solver_success=True,
@@ -1215,12 +1286,26 @@ class CrocoddylMPCNode(Node):
             self.cartesian_path_start_time = time.monotonic()
             self.cartesian_path_initialized_from_state = True
         self._update_cartesian_references(state[: self.model.nq])
+        if self.simulate and self.control_mode == "task_space" and not self.stationary_hold_active:
+            pose_error = self._pose_error(state[: self.model.nq], self.target_pose, self.pose_data)
+            # The ideal position servo can stop on the measured pose without another torque solve.
+            if (
+                np.linalg.norm(pose_error[:3]) <= self.stationary_hold_position_tolerance
+                and np.linalg.norm(pose_error[3:]) <= self.stationary_hold_orientation_tolerance
+            ):
+                self.stationary_hold_active = True
+                self.stationary_hold_target_count = self.target_update_count
+                self.stationary_hold_q = state[: self.model.nq].copy()
+                self.stationary_hold_cost = float(getattr(self.solver, "cost", 0.0))
         if (
             self.stationary_hold_active
             and self.stationary_hold_target_count == self.target_update_count
             and self.stationary_hold_q is not None
             and np.all(np.isfinite(self.stationary_hold_q))
-            and np.max(np.abs(state[: self.model.nq] - self.stationary_hold_q)) <= 1.0e-3
+            and (
+                self.simulate
+                or np.max(np.abs(state[: self.model.nq] - self.stationary_hold_q)) <= 1.0e-3
+            )
         ):
             self._publish_stationary_hold(state)
             return
@@ -1236,6 +1321,7 @@ class CrocoddylMPCNode(Node):
             solve_time_ms = 1.0e3 * (time.perf_counter() - solve_start)
             self.get_logger().error(f"MPC solve 실패: {exc}")
             self.solve_success_pub.publish(Float64(data=0.0))
+            self.status_pub.publish(String(data="exception"))
             self._write_diagnostic(
                 status="exception",
                 state=state,
@@ -1263,6 +1349,7 @@ class CrocoddylMPCNode(Node):
             not trajectory_finite
         ):
             self.solve_success_pub.publish(Float64(data=0.0))
+            self.status_pub.publish(String(data="invalid_solution"))
             self._write_diagnostic(
                 status="invalid_solution",
                 state=state,
@@ -1324,6 +1411,7 @@ class CrocoddylMPCNode(Node):
                 q_cmd = self._safe_joint_command(state[: self.model.nq], state)
         else:
             q_cmd = self._safe_joint_command(next_state[: self.model.nq], state)
+        prediction_guard = prediction_guard or self.cartesian_path_guard
         self.last_q_cmd = q_cmd.copy()
         self._publish_joint_command(q_cmd)
         stationary_hold_ready = bool(
@@ -1334,8 +1422,15 @@ class CrocoddylMPCNode(Node):
             and float(np.linalg.norm(task_error[3:]))
             <= self.stationary_hold_orientation_tolerance
         )
-        effective_success = bool(solved or stationary_hold_ready) and not bool(prediction_guard)
-        self.solve_success_pub.publish(Float64(data=1.0 if effective_success else 0.0))
+        solver_success = bool(solved or stationary_optimum)
+        status = (
+            self.cartesian_path_guard
+            or ("prediction_guard_hold" if prediction_guard else "")
+            or ("stationary_optimum" if stationary_optimum else "")
+            or ("solved" if solved else "not_converged")
+        )
+        self.solve_success_pub.publish(Float64(data=1.0 if solver_success else 0.0))
+        self.status_pub.publish(String(data=status))
         if stationary_hold_ready:
             self.stationary_hold_active = True
             self.stationary_hold_target_count = self.target_update_count
@@ -1349,19 +1444,11 @@ class CrocoddylMPCNode(Node):
             self._publish_sim_state()
             applied_state = np.r_[self.sim_q, self.sim_v].copy()
         self._write_diagnostic(
-            status=(
-                "prediction_guard_hold"
-                if prediction_guard
-                else "stationary_optimum"
-                if stationary_optimum
-                else "solved"
-                if solved
-                else "not_converged"
-            ),
+            status=status,
             state=state,
             target=self.target_pose,
             solve_time_ms=solve_time_ms,
-            solver_success=effective_success,
+            solver_success=solver_success,
             solver_iterations=solver_iterations,
             solver_cost=cost,
             stationary_optimum=stationary_optimum,
@@ -1402,7 +1489,46 @@ class CrocoddylMPCNode(Node):
         command = np.minimum(np.maximum(command, lower), upper)
         if not np.all(np.isfinite(command)):
             raise RuntimeError("joint-position safety filter produced a non-finite command")
+        self.cartesian_command_scale = 1.0
+        self.cartesian_path_guard = ""
+        if self.control_mode == "task_space":
+            start = self.cartesian_path_start_pose.translation
+            goal = self.target_pose.translation
+            deviation = float(np.linalg.norm(segment_error(
+                self._tcp_pose(measured_q).translation, start, goal
+            )[0]))
+            original_command = command.copy()
+            if deviation <= self.cartesian_path_tolerance:
+                command = project_cartesian_command(
+                    command, lower, upper,
+                    lambda q: self._tcp_pose(q).translation.copy(),
+                    self._tcp_position_jacobian,
+                    start, goal, self.cartesian_path_tolerance,
+                )
+            command, self.cartesian_command_scale = limit_cartesian_step(
+                measured_q, command,
+                lambda q: self._tcp_pose(q).translation.copy(),
+                start, goal, self.cartesian_path_tolerance, self.cartesian_reach_bound,
+            )
+            if deviation > self.cartesian_path_tolerance:
+                self.cartesian_path_guard = "cartesian_path_violation"
+                self.get_logger().error(
+                    f"TCP line deviation {deviation * 1000:.3f} mm exceeds "
+                    f"{self.cartesian_path_tolerance * 1000:.3f} mm; holding measured joints",
+                    throttle_duration_sec=2.0,
+                )
+            elif self.cartesian_command_scale == 0.0:
+                self.cartesian_path_guard = "cartesian_path_hold"
+            elif self.cartesian_command_scale < 1.0 or not np.array_equal(command, original_command):
+                self.cartesian_path_guard = "cartesian_path_limited"
         return command
+
+    def _tcp_position_jacobian(self, q: np.ndarray) -> np.ndarray:
+        self.pin.computeJointJacobians(self.model, self.pose_data, q)
+        self.pin.updateFramePlacements(self.model, self.pose_data)
+        return self.pin.getFrameJacobian(
+            self.model, self.pose_data, self.frame_id, self.pin.LOCAL_WORLD_ALIGNED
+        )[:3].copy()
 
     def _publish_joint_command(self, q_cmd: np.ndarray) -> None:
         message = Float64MultiArray()

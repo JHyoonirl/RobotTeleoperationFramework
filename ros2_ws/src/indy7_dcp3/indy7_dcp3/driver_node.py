@@ -14,7 +14,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64MultiArray
 from std_srvs.srv import SetBool
-from .safety import DOF, limit_joint_target, load_joint_limits, percent_ratio, six
+from .safety import DOF, load_joint_limits, percent_ratio, six, validate_joint_target
 
 
 OP_IDLE = 5
@@ -33,11 +33,10 @@ class Indy7Dcp3Node(Node):
         self.declare_parameter("deadman_topic", "/indy7_dcp3/deadman")
         self.declare_parameter("arm_service", "/indy7_dcp3/arm")
         self.declare_parameter("joint_names", [f"joint{i}" for i in range(DOF)])
-        self.declare_parameter("publish_rate", 20.0)
+        self.declare_parameter("publish_rate", 200.0)
         self.declare_parameter("command_timeout", 0.30)
         self.declare_parameter("deadman_timeout", 0.30)
         self.declare_parameter("joint_limit_margin", 0.05)
-        self.declare_parameter("max_joint_velocity", [0.05] * DOF)
         self.declare_parameter("velocity_ratio", 0.1)
         self.declare_parameter("acceleration_ratio", 1.0)
 
@@ -57,9 +56,6 @@ class Indy7Dcp3Node(Node):
         self.command_timeout = float(self.get_parameter("command_timeout").value)
         self.deadman_timeout = float(self.get_parameter("deadman_timeout").value)
         self.limit_margin = float(self.get_parameter("joint_limit_margin").value)
-        self.max_joint_velocity = six(
-            self.get_parameter("max_joint_velocity").value, "max_joint_velocity"
-        )
         self.velocity_ratio = percent_ratio(
             self.get_parameter("velocity_ratio").value, "velocity_ratio"
         )
@@ -79,9 +75,7 @@ class Indy7Dcp3Node(Node):
             raise ValueError("invalid DCP3 rate, timeout, or joint-limit margin")
 
         urdf = Path(get_package_share_directory("indy7_description")) / "urdf" / "indy7.urdf"
-        self.lower, self.upper, urdf_velocity = load_joint_limits(urdf, self.joint_names)
-        if np.any(self.max_joint_velocity > urdf_velocity):
-            raise ValueError("max_joint_velocity cannot exceed the Indy7 URDF velocity limits")
+        self.lower, self.upper = load_joint_limits(urdf, self.joint_names)
         if np.any(self.lower + self.limit_margin >= self.upper - self.limit_margin):
             raise ValueError("joint_limit_margin leaves no usable joint range")
 
@@ -164,13 +158,11 @@ class Indy7Dcp3Node(Node):
             response.message = f"Refusing to arm: DCP3 op_state={self.current_op_state}, expected IDLE(5)"
             return response
         try:
-            limit_joint_target(
+            validate_joint_target(
                 self.current_q,
                 self.latest_command,
                 self.lower,
                 self.upper,
-                self.max_joint_velocity,
-                self.period,
                 self.limit_margin,
             )
         except ValueError as exc:
@@ -237,13 +229,11 @@ class Indy7Dcp3Node(Node):
             return
 
         try:
-            target = limit_joint_target(
+            target = validate_joint_target(
                 q,
                 self.latest_command,
                 self.lower,
                 self.upper,
-                self.max_joint_velocity,
-                self.period,
                 self.limit_margin,
             )
         except ValueError as exc:

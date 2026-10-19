@@ -12,7 +12,7 @@ from pathlib import Path
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64
+from std_msgs.msg import Float64, String
 
 
 class MpcPlotter(Node):
@@ -36,6 +36,7 @@ class MpcPlotter(Node):
                 "orientation_error",
                 "cost",
                 "se3_tracking",
+                "cartesian_path",
                 "posture",
                 "velocity",
                 "torque",
@@ -49,6 +50,7 @@ class MpcPlotter(Node):
             )
         }
         self.latest = {name: float("nan") for name in self.history}
+        self.latest_status = ""
         self.lower, self.upper = self._read_joint_limits(
             str(self.get_parameter("urdf_path").value)
         )
@@ -58,6 +60,7 @@ class MpcPlotter(Node):
             "orientation_error": "/mpc/orientation_error",
             "cost": "/mpc/cost",
             "se3_tracking": "/mpc/cost/se3_tracking",
+            "cartesian_path": "/mpc/cost/cartesian_path",
             "posture": "/mpc/cost/posture",
             "velocity": "/mpc/cost/velocity",
             "torque": "/mpc/cost/torque",
@@ -76,6 +79,7 @@ class MpcPlotter(Node):
                 10,
             )
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, 10)
+        self.create_subscription(String, "/mpc/status", self._on_status, 10)
 
         try:
             import matplotlib
@@ -108,6 +112,7 @@ class MpcPlotter(Node):
         }
         cost_colors = {
             "se3_tracking": "tab:green",
+            "cartesian_path": "tab:orange",
             "posture": "tab:olive",
             "velocity": "tab:cyan",
             "torque": "tab:purple",
@@ -233,13 +238,7 @@ class MpcPlotter(Node):
             axis.relim()
             axis.autoscale_view()
         self.ax_success.set_ylim(-0.05, 1.05)
-        success = self.latest["solver_success"]
-        if not math.isfinite(success):
-            status, color = "waiting for MPC", "tab:gray"
-        elif success >= 0.5:
-            status, color = "solver OK", "tab:green"
-        else:
-            status, color = "SOLVER FAILED", "tab:red"
+        status, color = self._status_label(self.latest_status, self.latest["solver_success"])
         self.figure.suptitle(
             f"Indy7 MPC | {status} | "
             f"pos={self.latest['position_error']:.4g} m | "
@@ -249,6 +248,28 @@ class MpcPlotter(Node):
         )
         self.figure.canvas.draw_idle()
         self.figure.canvas.flush_events()
+
+    def _on_status(self, message: String) -> None:
+        self.latest_status = message.data
+
+    @staticmethod
+    def _status_label(status: str, success: float) -> tuple[str, str]:
+        if status == "cartesian_path_violation":
+            return "PATH VIOLATION | HOLD", "tab:red"
+        if status == "cartesian_path_hold":
+            return "PATH HOLD", "tab:orange"
+        if status == "cartesian_path_limited":
+            suffix = "" if success >= 0.5 else " | SOLVER NOT CONVERGED"
+            return "PATH LIMITED" + suffix, "tab:orange"
+        if status == "not_converged":
+            return "SOLVER NOT CONVERGED", "tab:orange"
+        if status in {"exception", "invalid_solution", "prediction_guard_hold"}:
+            return "SOLVER FAILED", "tab:red"
+        if not math.isfinite(success):
+            return "waiting for MPC", "tab:gray"
+        if success >= 0.5:
+            return "solver OK", "tab:green"
+        return "SOLVER NOT CONVERGED", "tab:orange"
 
     def destroy_node(self):
         if hasattr(self, "figure"):
