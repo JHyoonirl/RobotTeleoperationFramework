@@ -22,6 +22,8 @@ def generate_launch_description():
     joint_state_gui = LaunchConfiguration("joint_state_gui")
     plot = LaunchConfiguration("plot")
     rviz = LaunchConfiguration("rviz")
+    teleop_gui = LaunchConfiguration("teleop_gui")
+    teleop_minimal_gui = LaunchConfiguration("teleop_minimal_gui")
     def mpc_node(*, condition, remappings):
         return Node(
             package="indy7_mpc",
@@ -82,6 +84,16 @@ def generate_launch_description():
                 default_value="true",
                 description="Open RViz",
             ),
+            DeclareLaunchArgument(
+                "teleop_gui",
+                default_value="false",
+                description="Open sim-to-DCP3 mapping and teleoperation GUI",
+            ),
+            DeclareLaunchArgument(
+                "teleop_minimal_gui",
+                default_value="false",
+                description="Open the compact simulation-to-DCP3 teleoperation GUI",
+            ),
             Node(
                 package="joint_state_publisher_gui",
                 executable="joint_state_publisher_gui",
@@ -130,7 +142,27 @@ def generate_launch_description():
                     ("mpc/joint_position_cmd", "/forward_position_controller/commands")
                 ],
             ),
-            mpc_node(condition=UnlessCondition(simulate), remappings=[]),
+            mpc_node(
+                condition=UnlessCondition(simulate),
+                remappings=[
+                    ("joint_states", "/indy7_dcp3/joint_states"),
+                    ("mpc/joint_position_cmd", "/indy7_dcp3/joint_position_cmd"),
+                ],
+            ),
+            Node(
+                package="indy7_mpc",
+                executable="indy7_teleop_gui",
+                name="indy7_teleop_gui",
+                condition=IfCondition(teleop_gui),
+                output="screen",
+            ),
+            Node(
+                package="indy7_mpc",
+                executable="indy7_teleop_minimal_gui",
+                name="indy7_teleop_minimal_gui",
+                condition=IfCondition(teleop_minimal_gui),
+                output="screen",
+            ),
             Node(
                 package="rviz2",
                 executable="rviz2",

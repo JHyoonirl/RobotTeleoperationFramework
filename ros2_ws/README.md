@@ -178,7 +178,7 @@ docker exec robot-teleoperation bash -lc \
 `plots/summary.json`이 생성된다. `summary.json`에는 cost·tracking·solver·ABA
 동역학의 최종값/평균/최댓값이 들어 있다.
 
-입력 pose의 `header.frame_id`는 기본적으로 `world`여야 한다. 다른 frame을 쓰려면 먼저 TF 변환을 추가하거나 `pose_frame`을 맞춘다. `q_cmd`에는 URDF hard joint limit, measured-q 기준 velocity limit, cycle increment limit을 모두 적용한다. 실기에서는 `mpc/joint_position_cmd`를 IndyDCP3 adapter의 입력으로 사용하고, adapter에서 rad→deg 변환과 deadman/명령 watchdog을 적용한다. 물리 E-stop은 별도로 준비해야 한다. 실행 중 Crocoddyl 전체 목적함수 값은 다음 토픽에서 확인할 수 있다.
+입력 pose의 `header.frame_id`는 기본적으로 `world`여야 한다. 다른 frame을 쓰려면 먼저 TF 변환을 추가하거나 `pose_frame`을 맞춘다. `q_cmd`에는 URDF hard joint limit, measured-q 기준 velocity limit, cycle increment limit을 모두 적용한다. 실기 launch는 내부 `mpc/joint_position_cmd`를 `/indy7_dcp3/joint_position_cmd`로 remap하며 adapter가 rad→deg 변환과 deadman/명령 watchdog을 적용한다. 물리 E-stop은 별도로 준비해야 한다. 실행 중 Crocoddyl 전체 목적함수 값은 다음 토픽에서 확인할 수 있다.
 
 현재 적용 중인 Cartesian 속도 관련 YAML 파라미터는 다음과 같다.
 
@@ -272,7 +272,7 @@ docker exec robot-teleoperation bash -lc \
 docker exec robot-teleoperation bash -lc \
   'source /opt/ros/jazzy/setup.bash && \
    source /opt/robot_teleoperation_framework/install/setup.bash && \
-   ros2 topic echo /mpc/joint_position_cmd'
+   ros2 topic echo /indy7_dcp3/joint_position_cmd'
 
 docker exec robot-teleoperation bash -lc \
   'source /opt/ros/jazzy/setup.bash && \
@@ -356,6 +356,10 @@ docker exec robot-teleoperation bash -lc \
 
 ## Indy7 실기 teleoperation
 
+시뮬레이션의 관절 자세를 DCP3에 전달하는 GUI 절차는 최상위 README의
+[시뮬레이션 자세를 DCP3 실제 로봇에 보내는 GUI](../README.md#시뮬레이션-자세를-dcp3-실제-로봇에-보내는-gui)를 참고한다.
+실기 MPC 단독 조작은 아래 기존 흐름을 사용한다.
+
 계산과 하드웨어 연결은 별도 컨테이너다. MPC는 NumPy 2 / Crocoddyl을, DCP3 adapter는
 Neuromeka SDK와 NumPy 1을 사용하므로 같은 Python 환경에 설치하지 않는다.
 
@@ -416,7 +420,7 @@ arm 전에는 별도 확인 shell에서 실제 관절 feedback, 현재 TCP, MPC 
 
 ```bash
 make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
-ros2 topic echo /joint_states --once
+ros2 topic echo /indy7_dcp3/joint_states --once
 ros2 topic echo /indy7_dcp3/deadman --once
 ```
 
@@ -424,7 +428,7 @@ ros2 topic echo /indy7_dcp3/deadman --once
 make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
 ros2 topic echo /mpc/current_pose --once
 ros2 topic echo /mpc/desired_pose --once
-ros2 topic echo /mpc/joint_position_cmd --once
+ros2 topic echo /indy7_dcp3/joint_position_cmd --once
 ```
 
 deadman publisher를 켜 둔 채 **다른 DCP3 shell**에서 arm한다. arm 요청은 DCP3 feedback과 MPC

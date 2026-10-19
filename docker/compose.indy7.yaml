@@ -10,9 +10,13 @@ services:
       DISPLAY: ${DISPLAY:-}
       XAUTHORITY: /tmp/.Xauthority
       QT_X11_NO_MITSHM: "1"
+      # GPU devices are not passed through to this development container.
+      LIBGL_ALWAYS_SOFTWARE: "${LIBGL_ALWAYS_SOFTWARE:-1}"
+      INDY7_TELEOP_MAPPING: /var/lib/robot-teleoperation-dev/profiles/indy7_joint_mapping.yaml
     volumes:
       - ../:/workspace:ro
       - ../.docker-data/indy7-mpc:/var/lib/robot-teleoperation-dev
+      - ../.docker-data/indy7-mpc/profiles:/var/lib/robot-teleoperation-dev/profiles:rw
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ${XAUTHORITY_FILE:-${XAUTHORITY:-${HOME}/.Xauthority}}:/tmp/.Xauthority:ro
     command:

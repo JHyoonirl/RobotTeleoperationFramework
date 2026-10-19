@@ -363,6 +363,12 @@ class CrocoddylMPCNode(Node):
         # Both ros2_control simulation and the real driver expose joint_states.
         # A solve can exceed dt; queued feedback would make the controller chase old states.
         self.create_subscription(JointState, "joint_states", self._on_joint_state, 1)
+        self.create_subscription(
+            JointState,
+            "/indy7/sim/sync_joint_target",
+            self._on_sim_sync_joint_target,
+            10,
+        )
         self.state_pub = (
             self.create_publisher(JointState, "joint_states", 10)
             if self.internal_simulation
@@ -388,6 +394,9 @@ class CrocoddylMPCNode(Node):
         self.solve_iterations_pub = self.create_publisher(Float64, "mpc/solver_iterations", 10)
         self.solve_success_pub = self.create_publisher(Float64, "mpc/solver_success", 10)
         self.status_pub = self.create_publisher(String, "mpc/status", 10)
+        self.sim_sync_ack_pub = self.create_publisher(
+            String, "/indy7/sim/sync_joint_target/status", 10
+        )
         self.control_norm_pub = self.create_publisher(Float64, "mpc/control_norm", 10)
         self.cost_term_pubs = {
             name: self.create_publisher(Float64, f"mpc/cost/{name}", 10)
@@ -1193,6 +1202,72 @@ class CrocoddylMPCNode(Node):
             self.get_logger().info(
                 "Initial task target set to measured Indy7 TCP pose; waiting for teleop input."
             )
+
+    def _on_sim_sync_joint_target(self, message: JointState) -> None:
+        """Set the simulated Desired pose from a named, mapped robot posture."""
+        request_id = message.header.frame_id
+
+        def acknowledge(success: bool, detail: str) -> None:
+            self.sim_sync_ack_pub.publish(
+                String(
+                    data=json.dumps(
+                        {"request_id": request_id, "success": success, "message": detail}
+                    )
+                )
+            )
+
+        if not self.simulate:
+            acknowledge(False, "MPC is not in simulation mode.")
+            return
+        if self.control_mode != "task_space":
+            acknowledge(False, "Desired pose sync is available only in task_space control mode.")
+            return
+        if self.latest_state is None or time.monotonic() - self.last_state_update_monotonic > 0.5:
+            acknowledge(False, "Simulation joint state is unavailable or stale.")
+            return
+        if message.name != self.joint_names or len(message.position) != self.model.nq:
+            acknowledge(False, "The sync request has invalid joint names or an incorrect joint count.")
+            return
+        target_q = np.asarray(message.position, dtype=float)
+        if not np.all(np.isfinite(target_q)):
+            acknowledge(False, "The sync request contains invalid joint values.")
+            return
+        if np.any(target_q < self.model.lowerPositionLimit + 0.01) or np.any(
+            target_q > self.model.upperPositionLimit - 0.01
+        ):
+            acknowledge(False, "The sync target is outside or too close to a URDF joint limit.")
+            return
+
+        now = time.monotonic()
+        current_q = self.latest_state[: self.model.nq].copy()
+        current_pose = self._tcp_pose(current_q).copy()
+        target_pose = self._tcp_pose(target_q).copy()
+        self.cartesian_path_start_pose = current_pose
+        self.cartesian_path_start_time = now
+        self.cartesian_path_duration = self.cartesian_min_duration
+        self.cartesian_path_progress = 0.0
+        self.cartesian_path_guard = ""
+        self.cartesian_path_initialized_from_state = True
+        self.cartesian_reference_poses = [
+            current_pose.copy() for _ in range(self.horizon + 1)
+        ]
+        self.target_pose = target_pose
+        self.previous_target_pose = target_pose.copy()
+        self.xref = np.r_[target_q, np.zeros(self.model.nv)]
+        state_reference = np.r_[target_q, np.zeros(self.model.nv)]
+        self.xs = [state_reference.copy() for _ in range(self.horizon + 1)]
+        self.us = [np.zeros(self.model.nv) for _ in range(self.horizon)]
+        self.stationary_hold_active = False
+        self.stationary_hold_q = None
+        self.target_update_count += 1
+        self.last_target_update_monotonic = now
+        self.last_target_stamp_s = (
+            float(message.header.stamp.sec)
+            + float(message.header.stamp.nanosec) * 1.0e-9
+        )
+        self._publish_target_pose()
+        self.get_logger().info("Desired TCP pose synchronized from mapped robot joint state.")
+        acknowledge(True, "Applied the desired pose computed from the robot joint posture.")
 
     def _solver_is_numerically_stationary(self) -> bool:
         """Recognize FDDP's false negative at a zero-step optimum."""

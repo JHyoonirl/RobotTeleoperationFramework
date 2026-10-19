@@ -1,9 +1,14 @@
 # Indy7 DCP3 Adapter
 
 `indy7_dcp3` connects the Indy7 MPC to Neuromeka's IndyDCP3 client. It publishes actual joint
-feedback as `/joint_states` and forwards absolute joint positions from
-`/mpc/joint_position_cmd` in DCP3 `TELE_JOINT_ABSOLUTE` mode. MPC commands are radians; DCP3
+feedback as `/indy7_dcp3/joint_states` and forwards absolute joint positions from
+`/indy7_dcp3/joint_position_cmd` in DCP3 `TELE_JOINT_ABSOLUTE` mode. MPC commands are radians; DCP3
 receives degrees.
+
+The adapter publishes `/indy7_dcp3/armed` and `/indy7_dcp3/status` for the GUI. Arm requests
+return promptly and the 200 Hz feedback loop confirms `TELE_OP` asynchronously, so deadman and
+command heartbeats continue to be processed while the controller changes modes. The GUI publishes
+the mapped simulation target and refreshes `/indy7_dcp3/deadman` only while its hold button is down.
 
 `velocity_ratio` and `acceleration_ratio` use DCP3's 0-100 scale: `20.0` means
 20%. The adapter validates both values and passes them unchanged to
@@ -89,7 +94,7 @@ For ROS graph and feedback inspection, open another sourced shell:
 
 ```bash
 make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
-ros2 topic echo /joint_states --once
+ros2 topic echo /indy7_dcp3/joint_states --once
 ros2 topic echo /indy7_dcp3/deadman --once
 ```
 
@@ -118,7 +123,7 @@ in IDLE, the work area is clear, and the physical E-stop is immediately reachabl
 
 ```bash
 make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
-ros2 topic echo /joint_states --once
+ros2 topic echo /indy7_dcp3/joint_states --once
 ros2 topic echo /indy7_dcp3/deadman --once
 ```
 
@@ -126,7 +131,7 @@ ros2 topic echo /indy7_dcp3/deadman --once
 make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=mpc
 ros2 topic echo /mpc/current_pose --once
 ros2 topic echo /mpc/desired_pose --once
-ros2 topic echo /mpc/joint_position_cmd --once
+ros2 topic echo /indy7_dcp3/joint_position_cmd --once
 ```
 
 Terminal 5: leave the deadman publisher running in Terminal 4, then explicitly arm from another

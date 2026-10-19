@@ -17,7 +17,7 @@ DOCKER_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
 DOCKER_DCP3_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
 	/workspace/ros2_ws/src/indy7_dcp3
 
-.PHONY: build build-hand test list run-mpc docker-build docker-build-dcp3 docker-build-gui docker-test docker-run docker-run-gui docker-build-hand docker-up-hand docker-down-hand docker-check-indy7 docker-up-indy7 docker-shell-indy7 docker-down-indy7 docker-up-indy7-sim docker-shell-indy7-sim docker-launch-indy7-sim docker-keyboard-indy7-sim docker-down-indy7-sim
+.PHONY: build build-hand test list run-mpc docker-build docker-build-dcp3 docker-build-gui docker-test docker-run docker-run-gui docker-build-hand docker-up-hand docker-down-hand docker-check-indy7 docker-up-indy7 docker-shell-indy7 docker-down-indy7 docker-up-indy7-sim docker-shell-indy7-sim docker-launch-indy7-sim docker-launch-indy7-sim-minimal docker-keyboard-indy7-sim docker-down-indy7-sim
 
 build:
 	@test -f "$(ROS_SETUP)" || (echo "ROS 2 setup not found: $(ROS_SETUP)"; exit 1)
@@ -99,7 +99,7 @@ docker-up-indy7:
 		if ! docker image inspect "$(DOCKER_IMAGE):dcp3" >/dev/null 2>&1; then \
 			$(MAKE) docker-build-dcp3 DOCKER_IMAGE=$(DOCKER_IMAGE); \
 		fi; \
-		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc" "$(REPO_ROOT)/.docker-data/dcp3"; \
+		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc/profiles" "$(REPO_ROOT)/.docker-data/dcp3"; \
 		ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
 		INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
 		INDY7_ROBOT_IP=$(ROBOT_IP) \
@@ -129,7 +129,7 @@ docker-up-indy7-sim:
 		if ! docker image inspect "$(DOCKER_IMAGE):mpc-gui" >/dev/null 2>&1; then \
 			$(MAKE) docker-build-gui DOCKER_IMAGE=$(DOCKER_IMAGE); \
 		fi; \
-		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc"; \
+		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc/profiles"; \
 		ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
 		INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
 		INDY7_ROBOT_IP=127.0.0.1 \
@@ -157,7 +157,20 @@ docker-launch-indy7-sim:
 		$(DOCKER_BASE_PATHS) -- bash -lc 'exec 9>/tmp/indy7_mpc_sim.lock; \
 		flock -n 9 || { echo "An Indy7 simulation launch is already active. Stop it before starting another." >&2; exit 2; }; \
 		exec ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true \
-		initialize_target_from_current_state:=true rviz:=true plot:=true \
+		initialize_target_from_current_state:=true rviz:=true plot:=true teleop_gui:=true \
+		diagnostic_log_directory:=/tmp/indy7_mpc_logs'
+
+docker-launch-indy7-sim-minimal:
+	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+	INDY7_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+	INDY7_ROBOT_IP=127.0.0.1 \
+	docker compose -f docker/compose.indy7.yaml exec \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) -e LIBGL_ALWAYS_SOFTWARE=1 mpc \
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(DOCKER_BASE_PATHS) -- bash -lc 'exec 9>/tmp/indy7_mpc_sim.lock; \
+		flock -n 9 || { echo "An Indy7 simulation launch is already active. Stop it before starting another." >&2; exit 2; }; \
+		exec ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true \
+		initialize_target_from_current_state:=true rviz:=true plot:=true teleop_gui:=false teleop_minimal_gui:=true \
 		diagnostic_log_directory:=/tmp/indy7_mpc_logs'
 
 docker-keyboard-indy7-sim:
@@ -185,17 +198,20 @@ docker-run-gui:
 			docker buildx build --load --target mpc-gui \
 				-f docker/Dockerfile -t "$(DOCKER_IMAGE):mpc-gui" .; \
 		fi; \
-		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc"; \
+		mkdir -p "$(REPO_ROOT)/.docker-data/indy7-mpc/profiles"; \
 		docker run --rm -it --name robot-teleoperation --net=host --ipc=host \
 			--user "$$(id -u):$$(id -g)" -e HOME=/tmp -e ROS_DOMAIN_ID=77 \
 			-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) \
 			-e "DISPLAY=$$DISPLAY" \
 			-e XAUTHORITY=/tmp/.Xauthority \
 			-e QT_X11_NO_MITSHM=1 \
+			-e LIBGL_ALWAYS_SOFTWARE="$${LIBGL_ALWAYS_SOFTWARE:-1}" \
+			-e INDY7_TELEOP_MAPPING=/var/lib/robot-teleoperation-dev/profiles/indy7_joint_mapping.yaml \
 			-v "$$xauthority_file:/tmp/.Xauthority:ro" \
 			-v /tmp/.X11-unix:/tmp/.X11-unix:rw \
 			-v "$(REPO_ROOT):/workspace" \
 			-v "$(REPO_ROOT)/.docker-data/indy7-mpc:/var/lib/robot-teleoperation-dev" \
+			-v "$(REPO_ROOT)/.docker-data/indy7-mpc/profiles:/var/lib/robot-teleoperation-dev/profiles:rw" \
 			-w /workspace \
 			$(DOCKER_IMAGE):mpc-gui \
 			bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \

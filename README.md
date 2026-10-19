@@ -113,7 +113,7 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-build INCLUDE_HAND=1` | MPC, DCP3를 빌드한 뒤 Hand 이미지도 별도로 빌드합니다. 총 3개 이미지입니다. |
 | `make docker-build-dcp3` | Indy 실기 연결용 DCP3 이미지만 빌드합니다. |
 | `make docker-build-hand` | MANUS-WUJI Hand 이미지 하나만 빌드합니다. Indy 이미지는 빌드하지 않습니다. |
-| `make docker-build-gui` | RViz 실행에 필요한 별도 `mpc-gui` 이미지를 빌드합니다. |
+| `make docker-build-gui` | RViz와 Qt teleoperation GUI에 필요한 별도 `mpc-gui` 이미지를 빌드합니다. |
 | `make docker-test` | 이미 빌드된 MPC와 DCP3 이미지의 colcon 테스트 결과를 표시합니다. |
 | `make docker-run` | 저장소 소스를 마운트하고 source overlay를 준비해 셸을 엽니다. ROS launch는 직접 실행합니다. |
 | `make docker-run-gui` | GUI 지원 이미지가 없을 때만 빌드하고, 마운트된 source overlay로 셸을 엽니다. |
@@ -124,7 +124,8 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-shell-indy7 ROBOT_IP=<주소> INDY7_SERVICE=<service>` | `INDY7_SERVICE`를 `mpc` 또는 `dcp3`로 지정해 해당 컨테이너 shell에 들어갑니다. |
 | `make docker-down-indy7` | Indy7 Compose 컨테이너를 종료하고 정리합니다. |
 | `make docker-up-indy7-sim` | 실제 IP 없이 MPC 시뮬레이션 컨테이너만 시작합니다. DCP3 컨테이너는 시작하지 않습니다. |
-| `make docker-launch-indy7-sim` | mock ros2_control 시뮬레이션, RViz, MPC plot을 실행합니다. |
+| `make docker-launch-indy7-sim` | mock ros2_control 시뮬레이션, RViz, MPC plot, teleoperation GUI를 실행합니다. |
+| `make docker-launch-indy7-sim-minimal` | 기존 GUI는 유지하고, 조인트 매핑과 TCP 키보드 제어에 집중한 최소 GUI로 시뮬레이션을 실행합니다. |
 | `make docker-keyboard-indy7-sim` | 별도 터미널에서 키보드 TCP teleoperation을 실행합니다. |
 | `make docker-down-indy7-sim` | simulation MPC 컨테이너를 중지합니다. |
 
@@ -136,6 +137,9 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 의존성이나 Dockerfile 변경 시 이미지 자체를 갱신할 때 사용합니다. 기본 MPC 시뮬레이션은
 셸에서 직접 launch하며 `simulate`의 기본값은 `true`입니다. 소스 편집은 실행 중인 Python
 프로세스에 자동 반영되지 않으므로, 수정한 노드나 launch 코드는 MPC를 재시작해야 적용됩니다.
+
+새 최소 teleoperation GUI는 `FORCE_COLCON_BUILD=1 make docker-launch-indy7-sim-minimal`로
+실행합니다. 기존 전체 GUI는 `make docker-launch-indy7-sim` 타깃에서 그대로 사용할 수 있습니다.
 
 MPC cost 항목은 예외로, 실행 중인 노드가 로컬 마운트 파일을 0.25초 간격으로 확인합니다.
 호스트에서 다음 파일을 저장하면 컨테이너 안의 같은 파일이 즉시 보이고, 유효한 cost 변경은
@@ -205,6 +209,49 @@ docker exec -it robot-teleoperation bash -lc \
 
 두 토픽에 6관절 데이터가 나오면 simulation state와 MPC command 경로가 동작 중입니다.
 launch는 `Ctrl+C`로 종료합니다.
+
+### 시뮬레이션 자세를 DCP3 실제 로봇에 보내는 GUI
+
+GUI는 관절 이름 순서, 회전 방향, 영점 오프셋(도)을 편집하고 변환된 실제 관절 목표와
+측정값을 나란히 보여줍니다. `실제 자세 → 시뮬레이션 동기화`를 누르면 실측 관절값을
+역매핑해 MPC에 전달하고, MPC가 그 관절 자세의 FK로 Desired TCP pose를 설정합니다.
+이후 시뮬레이션의 현재 관절값을 매핑해 DCP3 명령으로 보냅니다. 초기 매핑은 관절별
+1:1, 방향 +1, 오프셋 0도이며 설정은 `.docker-data/indy7-mpc/profiles/indy7_joint_mapping.yaml`에 저장됩니다.
+
+GUI 이미지에는 PyQt5가 필요하므로 한 번 빌드하거나 갱신합니다. 새 GUI 실행 항목과
+package metadata를 overlay에 등록하기 위해 기존 overlay가 있으면 첫 실행에 강제 빌드합니다.
+
+```bash
+make docker-build-gui
+make docker-up-indy7 ROBOT_IP=controller-address
+```
+
+터미널 1에서 DCP3 피드백 adapter를 시작합니다.
+
+```bash
+make docker-shell-indy7 ROBOT_IP=controller-address INDY7_SERVICE=dcp3
+ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$INDY7_ROBOT_IP
+```
+
+터미널 2에서 MPC 시뮬레이션과 GUI를 시작합니다. `make docker-up-indy7`이 MPC와 DCP3
+개발 컨테이너를 모두 준비했으므로, 아래 실행 명령으로 mock 시뮬레이션만 launch됩니다.
+이미 만들어 둔 overlay를 사용 중이면 `FORCE_COLCON_BUILD=1`을 첫 실행에 추가합니다.
+
+```bash
+make docker-launch-indy7-sim FORCE_COLCON_BUILD=1
+```
+
+GUI에서 실제 관절 매핑을 확인·저장하고, **실제 자세 → 시뮬레이션 동기화**를 눌러
+시뮬레이션이 실측 자세에 도달하는지 확인합니다. Desired TCP pose는 이 자세에서
+계산됩니다. 목표를 XYZ·회전 버튼으로 조정한 다음, **매핑된 시뮬레이션 목표 전송 허용**을
+켜고 **Deadman 버튼을 누른 채 Arm**을 선택합니다. 시작 목표와 실측 로봇의 최대 관절
+오차가 기본 10°보다 크면 GUI에서 Arm을 막습니다. 매핑 오프셋을 조정하거나 다시
+동기화한 뒤 시작하세요. Deadman을 놓거나 창 포커스를 잃으면 adapter가 정지·disarm합니다.
+창을 닫으면 disarm 서비스를 요청합니다.
+
+정상 종료는 GUI의 **Disarm / 정지**를 누른 뒤 GUI와 DCP3 launch를 `Ctrl+C`로 종료하고,
+`make docker-down-indy7`을 실행합니다. `make docker-up-indy7-sim`만 사용하면 DCP3
+adapter가 시작되지 않으므로 실제 로봇 연결은 수행되지 않습니다.
 
 MANUS-WUJI는 독립 이미지와 컨테이너를 사용합니다. 다음 명령은 Hand 이미지와 MANUS
 publisher를 준비하지만, WUJI 드라이버와 retargeting launch는 자동으로 시작하지 않습니다.
@@ -404,6 +451,13 @@ make docker-run-gui
 이 명령은 `XAUTHORITY` 환경 변수를 사용하며, 설정되지 않았으면 `~/.Xauthority`를
 사용합니다. 컨테이너에는 Xauthority 파일을 읽기 전용으로 연결합니다.
 
+GUI 컨테이너는 기본적으로 소프트웨어 OpenGL 렌더링을 사용합니다. GPU 장치를
+전달하지 않는 환경에서 `failed to load driver: iris` 오류로 RViz가 표시되지 않는
+문제를 방지합니다. 기존 컨테이너에는 설정이 자동 반영되지 않으므로, 실행 중인
+launch를 종료하고 `make docker-up-indy7-sim`으로 컨테이너를 갱신한 뒤
+`make docker-launch-indy7-sim`을 다시 실행하세요. `make docker-run-gui`로 연 셸은
+종료 후 같은 명령으로 다시 여세요. 이미지 재빌드는 필요 없습니다.
+
 컨테이너를 직접 실행할 때는 `bash`를 명령으로 지정해 셸을 열 수 있습니다.
 `--net=host`와 `--ipc=host`는 ROS 2 DDS 통신을 호스트와 맞추기 위한 옵션입니다.
 
@@ -462,8 +516,8 @@ docker rm -f robot-teleoperation
 
 ## Hardware boundary
 
-`indy7_dcp3`는 Neuromeka의 `IndyDCP3` client를 통해 `/joint_states`를 내보내고,
-`/mpc/joint_position_cmd`를 `TELE_JOINT_ABSOLUTE` 관절 명령으로 전달합니다. 기본은
+`indy7_dcp3`는 Neuromeka의 `IndyDCP3` client를 통해 `/indy7_dcp3/joint_states`를 내보내고,
+`/indy7_dcp3/joint_position_cmd`를 `TELE_JOINT_ABSOLUTE` 관절 명령으로 전달합니다. 기본은
 disarmed이며 명령과 deadman이 계속 들어오고 로봇이 IDLE일 때만 arm할 수 있습니다.
 deadman 또는 MPC 명령이 끊기거나 관절 제한을 벗어나면 teleop을 정지합니다.
 

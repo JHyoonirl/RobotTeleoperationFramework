@@ -22,6 +22,12 @@ if (($# == 0)); then
     set -- bash
 fi
 
+# Keep colcon artifacts owned by the active container user. Older builds may
+# have been created as container root (shown as `nobody` on a user-namespaced
+# Docker host), which prevents a later non-root build from updating the cache.
+build_root="${build_root}/users/uid-$(id -u)"
+mkdir -p "$build_root"
+
 source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 if [[ -f /opt/robot-teleoperation-venv/bin/activate ]]; then
     source /opt/robot-teleoperation-venv/bin/activate

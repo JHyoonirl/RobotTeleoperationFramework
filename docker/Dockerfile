@@ -71,6 +71,7 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ros-jazzy-joint-state-publisher-gui \
         ros-jazzy-rviz2 \
+        python3-pyqt5 \
     && rm -rf /var/lib/apt/lists/*
 
 FROM base AS dcp3
