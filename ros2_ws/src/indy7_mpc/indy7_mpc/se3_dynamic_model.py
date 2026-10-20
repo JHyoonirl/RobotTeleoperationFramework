@@ -30,6 +30,9 @@ class SE3DynamicActionModel:
         joint_limit_margin=0.2,
         torque_limits=None,
         path_tolerance=None,
+        minimum_z=None,
+        floor_margin=0.001,
+        floor_weight=1.0e6,
     ):
         class _ActionModel(crocoddyl.DifferentialActionModelAbstract):
             def __init__(self):
@@ -45,6 +48,14 @@ class SE3DynamicActionModel:
                 ):
                     raise ValueError("path_tolerance must be positive and finite")
                 self.path_weight = 0.0 if path_tolerance is None else 1.0 / path_tolerance**2
+                if (minimum_z is not None and not np.isfinite(minimum_z)) or (
+                    not np.isfinite(floor_margin) or floor_margin <= 0.0
+                    or not np.isfinite(floor_weight) or floor_weight <= 0.0
+                ):
+                    raise ValueError("Floor height must be finite; margin and weight must be positive and finite")
+                self.minimum_z = minimum_z
+                self.floor_margin = float(floor_margin)
+                self.floor_weight = float(floor_weight)
                 self.nominal_posture = np.asarray(nominal_posture, dtype=float).copy()
                 self.weights = {name: float(value) for name, value in weights.items()}
                 self.terminal_scale = float(terminal_scale)
@@ -76,6 +87,7 @@ class SE3DynamicActionModel:
                 self.cost_names = (
                     "se3_tracking",
                     "cartesian_path",
+                    "workspace_floor",
                     "posture",
                     "velocity",
                     "torque",
@@ -96,6 +108,12 @@ class SE3DynamicActionModel:
                     self.path_start,
                     self.path_goal,
                 )
+
+            def _floor_error(self):
+                if self.minimum_z is None:
+                    return 0.0
+                height = float(self.pin_data.oMf[self.frame_id].translation[2])
+                return min(0.0, height - self.minimum_z - self.floor_margin)
 
             def _pose_error(self, q):
                 self.pin.forwardKinematics(self.model, self.pin_data, q)
@@ -165,6 +183,7 @@ class SE3DynamicActionModel:
                 terms["cartesian_path"] = (
                     scale * 0.5 * self.path_weight * float(path_error @ path_error)
                 )
+                terms["workspace_floor"] = scale * 0.5 * self.floor_weight * self._floor_error() ** 2
                 return terms, pose_error
 
             def cost_terms(self, x, u):
@@ -257,6 +276,15 @@ class SE3DynamicActionModel:
                 data.Lxx[: self.nq, : self.nq] += path_weight * (
                     path_jacobian.T @ path_jacobian
                 )
+
+                floor_error = self._floor_error()
+                if floor_error < 0.0:
+                    height_jacobian = world_position_jacobian[2]
+                    floor_weight = scale * self.floor_weight
+                    data.Lx[: self.nq] += floor_weight * floor_error * height_jacobian
+                    data.Lxx[: self.nq, : self.nq] += floor_weight * np.outer(
+                        height_jacobian, height_jacobian
+                    )
 
                 posture_weight = self.terminal_scale * self.weights["posture"]
                 posture_error = q - self.nominal_posture

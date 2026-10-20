@@ -21,6 +21,8 @@ setup(
         "console_scripts": [
             "crocoddyl_mpc_node = indy7_mpc.crocoddyl_mpc_node:main",
             "keyboard_teleop = indy7_mpc.keyboard_teleop:main",
+            "indy7_vive_mapper = indy7_mpc.vive_pose_mapper:main",
+            "indy7_vive_mapping_gui = indy7_mpc.vive_mapping_gui:main",
             "indy7_teleop_gui = indy7_mpc.teleop_gui:main",
             "indy7_teleop_minimal_gui = indy7_mpc.teleop_minimal_gui:main",
             "mpc_plotter = indy7_mpc.mpc_plotter:main",

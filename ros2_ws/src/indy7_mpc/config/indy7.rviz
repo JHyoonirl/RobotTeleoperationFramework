@@ -8,7 +8,7 @@ Panels:
         - /Indy71/Description Topic1
         - /Pose1
       Splitter Ratio: 0.5
-    Tree Height: 849
+    Tree Height: 480
 Visualization Manager:
   Class: ""
   Displays:
@@ -69,6 +69,10 @@ Visualization Manager:
           Alpha: 1
           Show Axes: false
           Show Trail: false
+        hand_tcp:
+          Alpha: 1
+          Show Axes: true
+          Show Trail: false
         world:
           Alpha: 1
           Show Axes: false
@@ -102,7 +106,8 @@ Visualization Manager:
                   link4:
                     link5:
                       link6:
-                        tcp: {}
+                        tcp:
+                          hand_tcp: {}
     - Alpha: 0.5
       Cell Size: 1
       Class: rviz_default_plugins/Grid
@@ -161,6 +166,42 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /mpc/current_pose
       Value: true
+    - Class: rviz_default_plugins/Pose
+      Name: Hand TCP
+      Enabled: true
+      Shape: Axes
+      Axes Length: 0.12
+      Axes Radius: 0.006
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /indy7/hand_tcp/current_pose
+    - Class: rviz_default_plugins/Pose
+      Name: Selected Hand Target
+      Enabled: true
+      Shape: Axes
+      Axes Length: 0.18
+      Axes Radius: 0.009
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /indy7/hand_target_pose
+    - Class: rviz_default_plugins/Pose
+      Name: Vive Hand Target
+      Enabled: true
+      Shape: Axes
+      Axes Length: 0.16
+      Axes Radius: 0.008
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /indy7/vive/hand_target_pose
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
@@ -200,10 +241,9 @@ Visualization Manager:
 Window Geometry:
   Displays:
     collapsed: false
-  Height: 1077
+  Height: 720
   Hide Left Dock: false
   Hide Right Dock: false
-  QMainWindow State: 000000ff00000000fd000000010000000000000156000003d7fc0200000001fb000000100044006900730070006c006100790073010000003f000003d7000000cc00ffffff000006a6000003d700000004000000040000000800000008fc0000000100000002000000010000000a0054006f006f006c00730100000000ffffffff0000000000000000
-  Width: 2050
-  X: 60
-  Y: 534
+  Width: 1000
+  X: 40
+  Y: 40

@@ -28,6 +28,7 @@ RUN apt-get update \
         python3-pytest \
         python3-venv \
         ros-jazzy-robot-state-publisher \
+        ros-jazzy-tf2-ros-py \
         ros-jazzy-ros2-control \
         ros-jazzy-ros2-control-test-assets \
         ros-jazzy-controller-manager \

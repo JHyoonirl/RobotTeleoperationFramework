@@ -5,6 +5,8 @@
 crocoddyl_mpc:
   ros__parameters:
     # Primary controller: task-space SE(3) target on the URDF's tcp frame.
+    # Vive simulation following selects vive_hand_frame (hand_tcp) instead,
+    # so its tracking residual and Cartesian path both follow the hand.
     control_mode: task_space
     task_frame: tcp
     pose_frame: world
@@ -59,6 +61,15 @@ crocoddyl_mpc:
     # position limits and the measured-q +/- min(v_max*dt, increment) window.
     command_velocity_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
     command_increment_limits: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+
+    # Horizontal floor in URDF world coordinates, applied to task_frame
+    # (hand_tcp for the minimal Keyboard/Topic Pose GUI). Units: metres.
+    # A 1 mm planning clearance keeps the optimizer off the hard plane.
+    # The final q_cmd filter checks the continuous joint-linear step as well.
+    workspace_floor_enabled: true
+    workspace_min_z: 0.15
+    workspace_floor_margin: 0.001
+    workspace_floor_cost_weight: 1000000.0
 
     # Cartesian line-reference generator.  0.05 m/s is a conservative
     # starting value. Orientation is limited independently in rad/s.

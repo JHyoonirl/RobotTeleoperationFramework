@@ -2,10 +2,26 @@ from pathlib import Path
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.conditions import IfCondition, UnlessCondition
-from launch.substitutions import FindExecutable, LaunchConfiguration
+from launch.substitutions import EnvironmentVariable, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
+
+
+def _launch_rviz(context, default_config):
+    config = Path(LaunchConfiguration("rviz_config").perform(context)).expanduser()
+    if not config.exists():
+        contents = Path(default_config).read_bytes()
+        config.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with config.open("xb") as stream:
+                stream.write(contents)
+        except FileExistsError:
+            pass
+    if not config.is_file():
+        raise RuntimeError(f"RViz config must be a file: {config}")
+    return [Node(package="rviz2", executable="rviz2", name="rviz2",
+                 arguments=["-d", str(config)], output="screen")]
 
 
 def generate_launch_description():
@@ -36,6 +52,8 @@ def generate_launch_description():
                     "config_file_path": config_file,
                     "simulate": simulate,
                     "initialize_target_from_current_state": initialize_target_from_current_state,
+                    "start_paused": LaunchConfiguration("mpc_start_paused"),
+                    "enable_vive_follow": LaunchConfiguration("vive_mapping"),
                     "diagnostic_log_directory": diagnostic_log_directory,
                 },
             ],
@@ -85,6 +103,12 @@ def generate_launch_description():
                 description="Open RViz",
             ),
             DeclareLaunchArgument(
+                "rviz_config",
+                default_value=EnvironmentVariable(
+                    "INDY7_RVIZ_CONFIG", default_value=str(share / "config" / "indy7.rviz")),
+                description="Writable RViz config reused across launches; seeded once if missing",
+            ),
+            DeclareLaunchArgument(
                 "teleop_gui",
                 default_value="false",
                 description="Open sim-to-DCP3 mapping and teleoperation GUI",
@@ -93,6 +117,18 @@ def generate_launch_description():
                 "teleop_minimal_gui",
                 default_value="false",
                 description="Open the compact simulation-to-DCP3 teleoperation GUI",
+            ),
+            DeclareLaunchArgument(
+                "vive_mapping", default_value="false",
+                description="Start the Vive hand pose mapper for the GUI mapping panel",
+            ),
+            DeclareLaunchArgument(
+                "mpc_start_paused", default_value="false",
+                description="Wait for F7 before running the simulation MPC",
+            ),
+            DeclareLaunchArgument(
+                "vive_input_pose_topic", default_value="/tracker/right/pose",
+                description="Vive hand PoseStamped input for the mapper",
             ),
             Node(
                 package="joint_state_publisher_gui",
@@ -164,12 +200,18 @@ def generate_launch_description():
                 output="screen",
             ),
             Node(
-                package="rviz2",
-                executable="rviz2",
-                name="rviz2",
-                arguments=["-d", str(share / "config" / "indy7.rviz")],
-                condition=IfCondition(rviz),
+                package="indy7_mpc", executable="indy7_vive_mapper",
+                name="indy7_vive_mapper",
+                condition=IfCondition(LaunchConfiguration("vive_mapping")),
+                parameters=[str(share / "config" / "indy7_vive_mapping.yaml"),
+                            {"input_pose_topic": LaunchConfiguration("vive_input_pose_topic")}],
+                additional_env={"FASTDDS_BUILTIN_TRANSPORTS": "UDPv4"},
                 output="screen",
+            ),
+            OpaqueFunction(
+                function=_launch_rviz,
+                kwargs={"default_config": str(share / "config" / "indy7.rviz")},
+                condition=IfCondition(rviz),
             ),
             Node(
                 package="indy7_mpc",

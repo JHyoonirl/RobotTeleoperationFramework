@@ -140,6 +140,29 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 
 새 최소 teleoperation GUI는 `FORCE_COLCON_BUILD=1 make docker-launch-indy7-sim-minimal`로
 실행합니다. 기존 전체 GUI는 `make docker-launch-indy7-sim` 타깃에서 그대로 사용할 수 있습니다.
+최소 GUI 타깃은 Vive 매핑 노드도 함께 실행합니다. GUI의 `Hand Target Teleoperation` 패널에서
+입력과 hand TCP가 준비되면 `Map / Sync Current Pose (F5)`를 누르면 됩니다.
+이 타깃은 MPC를 대기 상태로 시작합니다. F5 매핑 후 F7을 누르고 있는 동안
+로봇 연결 없이 시뮬레이션의 hand TCP가 Vive 목표를 추종하고, F7을 놓으면 정지합니다.
+GUI의 Run 버튼도 누르고 있는 동안만 실행됩니다. GUI 포커스 이탈·종료 시에도
+정지하며, GUI 입력 유지 신호가 0.35초 이상 끊기면 MPC가 추종을 중단합니다.
+GUI의 `Hand Target Teleoperation`에서 `Keyboard`와 `Topic Pose`를 선택할 수 있습니다.
+두 모드 모두 `hand_tcp`가 공통 `hand_target`을 추종합니다. Keyboard는 트래커 없이
+현재 hand 자세에서 키·버튼으로 목표를 편집하고, Topic Pose는 선택한 pose 토픽을
+F5로 매핑합니다. F7을 놓은 뒤 모드를 바꾸고, 다시 누르고 있어야 실행됩니다.
+F6는 실측 관절로 시뮬레이션 정렬과 목표 재매핑을 수행한 뒤 DCP3 teleoperation을
+켜며, 다시 누르면 끕니다. 연결 중에는 F7을 누르고 있는 동안 로봇도 추종하고,
+F7을 놓으면 현재 자세에서 대기합니다. DCP3 드라이버는 별도 터미널에서
+`FORCE_COLCON_BUILD=1 make docker-launch-indy7-dcp3 ROBOT_IP=실제_IP`로 실행합니다.
+
+Indy7 `hand_tcp` 정의와 Vive pose의 Indy7 world 매핑은
+[`indy7_mpc/README.md`](ros2_ws/src/indy7_mpc/README.md)에 정리되어 있습니다.
+단독 매핑 GUI는 `ros2 launch indy7_mpc indy7_vive_mapping.launch.py gui:=true`로
+실행합니다. 최소 GUI 타깃을 사용할 때는 매핑 노드를 중복 실행하지 않습니다.
+F5 또는 `/indy7/vive_mapping/sync` 서비스로 현재 Vive pose를 현재 hand TCP에
+동기화합니다. 입력 기본값은 `/tracker/right/pose`, 출력은
+`/indy7/vive/hand_target_pose`입니다. 단독 매핑 launch는 pose/TF 확인용이며,
+최소 GUI에서는 F7로 시뮬레이션 MPC 추종을 시작합니다.
 
 MPC cost 항목은 예외로, 실행 중인 노드가 로컬 마운트 파일을 0.25초 간격으로 확인합니다.
 호스트에서 다음 파일을 저장하면 컨테이너 안의 같은 파일이 즉시 보이고, 유효한 cost 변경은
@@ -450,6 +473,13 @@ make docker-run-gui
 
 이 명령은 `XAUTHORITY` 환경 변수를 사용하며, 설정되지 않았으면 `~/.Xauthority`를
 사용합니다. 컨테이너에는 Xauthority 파일을 읽기 전용으로 연결합니다.
+
+RViz 설정은 호스트의 `.docker-data/indy7-mpc/rviz/indy7.rviz`와 컨테이너의
+`/var/lib/robot-teleoperation-dev/rviz/indy7.rviz`가 읽기·쓰기 마운트로 연결됩니다.
+처음 실행할 때만 1000×720 기본 설정을 복사하고, 이후에는 저장된 파일을 재사용합니다.
+RViz 창 크기·패널·카메라를 조정한 뒤 RViz에서 `Ctrl+S` 또는 `File -> Save Config`를
+누르면 로컬 파일에 저장됩니다. 다음 실행, 컨테이너 재생성, colcon 재빌드 후에도
+유지됩니다. 다른 파일을 쓰려면 launch의 `rviz_config:=<컨테이너 경로>`로 지정하세요.
 
 GUI 컨테이너는 기본적으로 소프트웨어 OpenGL 렌더링을 사용합니다. GPU 장치를
 전달하지 않는 환경에서 `failed to load driver: iris` 오류로 RViz가 표시되지 않는

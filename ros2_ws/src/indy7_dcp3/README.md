@@ -20,6 +20,16 @@ keeps a 0.05 rad soft-limit margin, and forwards validated joint targets unchang
 200 Hz. The adapter does not apply an additional per-cycle joint velocity clip. A stale
 command/deadman or invalid target stops teleoperation and requires a new arm request.
 
+The minimal Hand Target GUI now supports **F6 Connect Robot**. Start this adapter
+with `FORCE_COLCON_BUILD=1 make docker-launch-indy7-dcp3 ROBOT_IP=controller-address`
+after `make docker-up-indy7 ROBOT_IP=controller-address`, and run the simulation
+GUI with `FORCE_COLCON_BUILD=1 make docker-launch-indy7-sim-minimal`. F6 aligns the
+paused simulation to measured joints, re-anchors the hand target, enables the
+mapped command stream and managed Deadman, and requests this adapter's existing
+arm service. Only confirmed `TELE_OP` is shown as connected. F7 must remain held
+for MPC motion; releasing F7 holds position, and F6 again stops/disarms. See the
+[GUI workflow](../indy7_mpc/README.md#f6-robot-connection-dcp3-tele_op) for details.
+
 These software checks are not safety-rated. They do not provide collision monitoring, workspace
 supervision, or a safety-rated E-stop. Keep the physical E-stop accessible and follow Neuromeka's
 commissioning and safety procedures.

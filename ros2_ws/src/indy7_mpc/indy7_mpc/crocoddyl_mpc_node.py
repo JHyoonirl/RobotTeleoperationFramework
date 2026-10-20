@@ -20,17 +20,20 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Float64MultiArray, String
 
 from .cartesian_path import limit_cartesian_step, project_cartesian_command, segment_error
 from .mpc_cost_config import apply_runtime_cost_settings, load_runtime_cost_settings
 from .se3_dynamic_model import SE3DynamicActionModel
+from .vive_simulation_control import ViveSimulationControl
+from .workspace_floor import limit_height_step
 
 
 class CrocoddylMPCNode(Node):
-    def __init__(self) -> None:
-        super().__init__("indy7_crocoddyl_mpc")
+    def __init__(self, **kwargs) -> None:
+        super().__init__("indy7_crocoddyl_mpc", **kwargs)
         self.declare_parameter("urdf_path", "")
         self.declare_parameter("config_file_path", "")
         self.declare_parameter("control_mode", "task_space")
@@ -51,11 +54,30 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("max_solver_iterations", 10)
         self.declare_parameter("simulate", False)
         self.declare_parameter("initialize_target_from_current_state", False)
+        self.declare_parameter("start_paused", False)
+        self.declare_parameter("enable_vive_follow", False)
+        self.declare_parameter("vive_hand_frame", "hand_tcp")
+        self.declare_parameter("vive_hand_pose_topic", "/indy7/vive/hand_target_pose")
+        self.declare_parameter("vive_mapping_status_topic", "/indy7/vive_mapping/status")
+        self.declare_parameter("vive_run_service", "/indy7/sim/vive_mpc_run")
+        self.declare_parameter("vive_run_status_topic", "/indy7/sim/vive_mpc_status")
+        self.declare_parameter("vive_hold_topic", "/indy7/sim/vive_mpc_hold")
+        self.declare_parameter("vive_hold_timeout", 0.35)
+        self.declare_parameter("teleop_input_mode", "topic")
+        self.declare_parameter("teleop_mode_service", "/indy7/sim/keyboard_mode")
+        self.declare_parameter("keyboard_hand_pose_topic", "/indy7/keyboard/hand_target_pose")
+        self.declare_parameter("hand_target_pose_topic", "/indy7/hand_target_pose")
+        self.declare_parameter("hand_target_frame", "hand_target")
+        self.declare_parameter("vive_input_timeout", 0.5)
         # Keep a deterministic local plant only for standalone smoke tests.
         # Normal simulation uses ros2_control and its joint_states topic.
         self.declare_parameter("internal_simulation", False)
         self.declare_parameter("command_velocity_limits", [1.0] * 6)
         self.declare_parameter("command_increment_limits", [0.02] * 6)
+        self.declare_parameter("workspace_floor_enabled", True)
+        self.declare_parameter("workspace_min_z", 0.10)
+        self.declare_parameter("workspace_floor_margin", 0.001)
+        self.declare_parameter("workspace_floor_cost_weight", 1.0e6)
         # Cartesian reference generator.  The MPC still solves in q/qdot, but
         # each shooting stage receives a point on a bounded-speed SE(3) path.
         self.declare_parameter("cartesian_max_speed", 0.05)
@@ -128,7 +150,15 @@ class CrocoddylMPCNode(Node):
         self.control_mode = str(self.get_parameter("control_mode").value).strip().lower()
         if self.control_mode not in {"task_space", "joint"}:
             raise ValueError("control_mode는 task_space 또는 joint여야 합니다.")
-        self.task_frame = str(self.get_parameter("task_frame").value)
+        self.simulate = self._as_bool(self.get_parameter("simulate").value)
+        self.vive_follow_enabled = self.simulate and self._as_bool(
+            self.get_parameter("enable_vive_follow").value
+        )
+        # Vive targets describe the hand itself. Evaluate tracking, Jacobians
+        # and Cartesian path limits at that point, including during rotation.
+        self.task_frame = str(self.get_parameter(
+            "vive_hand_frame" if self.vive_follow_enabled else "task_frame"
+        ).value)
         self.pose_frame = str(self.get_parameter("pose_frame").value)
         self.teleop_pose_topic = str(self.get_parameter("teleop_pose_topic").value).strip()
         self.command_pose_topic = str(self.get_parameter("command_pose_topic").value).strip()
@@ -138,6 +168,18 @@ class CrocoddylMPCNode(Node):
         self.frame_id = self.model.getFrameId(self.task_frame)
         if self.frame_id >= len(self.model.frames):
             raise ValueError(f"URDF frame을 찾을 수 없습니다: {self.task_frame}")
+        self.workspace_floor_enabled = self._as_bool(self.get_parameter("workspace_floor_enabled").value)
+        self.workspace_min_z = float(self.get_parameter("workspace_min_z").value)
+        self.workspace_floor_margin = float(self.get_parameter("workspace_floor_margin").value)
+        self.workspace_floor_cost_weight = float(self.get_parameter("workspace_floor_cost_weight").value)
+        if (not np.isfinite(self.workspace_min_z)
+                or not np.isfinite(self.workspace_floor_margin) or self.workspace_floor_margin <= 0.0
+                or not np.isfinite(self.workspace_floor_cost_weight) or self.workspace_floor_cost_weight <= 0.0):
+            raise ValueError("workspace_min_z must be finite; floor margin/weight must be positive and finite")
+        if self.workspace_floor_enabled and self.pose_frame != "world":
+            raise ValueError("The workspace floor requires pose_frame='world' (the URDF root)")
+        if self.vive_follow_enabled:
+            self.set_parameters([Parameter("task_frame", value=self.task_frame)])
 
         self.goal = self._parse_vector(self.get_parameter("goal").value, 6)
         self.nominal_posture = self._parse_vector(
@@ -230,12 +272,6 @@ class CrocoddylMPCNode(Node):
         self.stationary_hold_orientation_tolerance = float(
             self.get_parameter("stationary_hold_orientation_tolerance").value
         )
-        simulation_value = self.get_parameter("simulate").value
-        self.simulate = (
-            simulation_value
-            if isinstance(simulation_value, bool)
-            else str(simulation_value).strip().lower() in {"1", "true", "yes", "on"}
-        )
         self.internal_simulation = self._as_bool(
             self.get_parameter("internal_simulation").value
         )
@@ -243,6 +279,11 @@ class CrocoddylMPCNode(Node):
             self.get_parameter("initialize_target_from_current_state").value
         )
         self.initial_target_state_initialized = not self.initialize_target_from_current_state
+        self.execution_enabled = not self._as_bool(self.get_parameter("start_paused").value)
+        self._paused_alignment_target = None
+        self._paused_alignment_deadline = 0.0
+        self.vive_control = None
+        self._last_paused_publish = -float("inf")
         cost_weights = (
             self.se3_position_cost_weight,
             self.se3_orientation_cost_weight,
@@ -282,7 +323,7 @@ class CrocoddylMPCNode(Node):
         if not np.isfinite(self.cartesian_path_tolerance) or self.cartesian_path_tolerance <= 0.0:
             raise ValueError("cartesian_path_tolerance은 양수인 유한값이어야 합니다 [m].")
         # The continuous command-step bound assumes bounded revolute joints.
-        if self.control_mode == "task_space" and any(
+        if (self.control_mode == "task_space" or self.workspace_floor_enabled) and any(
             not joint.shortname().startswith("JointModelR") or joint.nq != 1 or joint.nv != 1
             for joint in list(self.model.joints)[1:]
         ):
@@ -333,12 +374,13 @@ class CrocoddylMPCNode(Node):
         self.cartesian_path_deviation = 0.0
         self.cartesian_command_scale = 1.0
         self.cartesian_path_guard = ""
+        self.workspace_floor_guard = ""
         self.cartesian_path_initialized_from_state = False
         self.cartesian_reference_poses = [
-            self.target_pose.copy() for _ in range(self.horizon + 1)
+            self._optimization_target_pose() for _ in range(self.horizon + 1)
         ]
         if self.control_mode == "task_space":
-            self.xref = np.r_[self._solve_ik(self.target_pose, self.sim_q), np.zeros(self.model.nv)]
+            self.xref = np.r_[self._solve_ik(self._optimization_target_pose(), self.sim_q), np.zeros(self.model.nv)]
         else:
             self.xref = np.r_[self.goal, np.zeros(self.model.nv)]
         self.problem, self.solver = self._make_problem()
@@ -403,6 +445,7 @@ class CrocoddylMPCNode(Node):
             for name in (
                 "se3_tracking",
                 "cartesian_path",
+                "workspace_floor",
                 "posture",
                 "velocity",
                 "torque",
@@ -418,6 +461,8 @@ class CrocoddylMPCNode(Node):
         self.last_target_update_dt = float("nan")
         self.last_target_delta_rotation_world = np.zeros(3)
         self.last_target_angular_velocity_world = np.zeros(3)
+        if self.vive_follow_enabled:
+            self.vive_control = ViveSimulationControl(self)
         self._diagnostic_start_monotonic = time.monotonic()
         self._open_diagnostic_log(urdf_path)
         self.create_timer(self.dt, self._solve_once)
@@ -502,6 +547,10 @@ class CrocoddylMPCNode(Node):
                 "internal_simulation",
                 "command_velocity_limits",
                 "command_increment_limits",
+                "workspace_floor_enabled",
+                "workspace_min_z",
+                "workspace_floor_margin",
+                "workspace_floor_cost_weight",
                 "cartesian_max_speed",
                 "cartesian_max_angular_speed",
                 "cartesian_speed_margin",
@@ -871,6 +920,9 @@ class CrocoddylMPCNode(Node):
                 torque_limits=self.torque_limits,
                 path_tolerance=self.cartesian_path_tolerance
                 if self.control_mode == "task_space" else None,
+                minimum_z=self.workspace_min_z if self.workspace_floor_enabled else None,
+                floor_margin=self.workspace_floor_margin,
+                floor_weight=self.workspace_floor_cost_weight,
             )
             self.running_actions.append(action)
             running_models.append(c.IntegratedActionModelEuler(action, self.dt))
@@ -881,7 +933,7 @@ class CrocoddylMPCNode(Node):
             model=self.model,
             state=self.state,
             frame_id=self.frame_id,
-            target=self.target_pose,
+            target=self._optimization_target_pose(),
             nominal_posture=nominal_posture,
             weights=task_weights,
             terminal_scale=self.terminal_cost_weight,
@@ -889,6 +941,9 @@ class CrocoddylMPCNode(Node):
             torque_limits=self.torque_limits,
             path_tolerance=self.cartesian_path_tolerance
             if self.control_mode == "task_space" else None,
+            minimum_z=self.workspace_min_z if self.workspace_floor_enabled else None,
+            floor_margin=self.workspace_floor_margin,
+            floor_weight=self.workspace_floor_cost_weight,
             terminal=True,
         )
         terminal_model = c.IntegratedActionModelEuler(self.terminal_action, 0.0)
@@ -985,7 +1040,7 @@ class CrocoddylMPCNode(Node):
         """Interpolate position linearly and orientation on SO(3)."""
         alpha = float(np.clip(alpha, 0.0, 1.0))
         start = self.cartesian_path_start_pose
-        goal = self.target_pose
+        goal = self._optimization_target_pose()
         position = (1.0 - alpha) * start.translation + alpha * goal.translation
         rotation_delta = self.pin.log3(start.rotation.T @ goal.rotation)
         rotation = start.rotation @ self.pin.exp3(alpha * rotation_delta)
@@ -995,17 +1050,18 @@ class CrocoddylMPCNode(Node):
         """Refresh every Crocoddyl stage with a bounded-speed Cartesian line."""
         if self.control_mode != "task_space":
             self.cartesian_reference_poses = [
-                self.target_pose.copy() for _ in range(self.horizon + 1)
+                self._optimization_target_pose() for _ in range(self.horizon + 1)
             ]
             self.cartesian_path_speed = 0.0
             self.cartesian_path_progress = 1.0
             self.cartesian_path_deviation = 0.0
         else:
-            displacement = self.target_pose.translation - self.cartesian_path_start_pose.translation
+            goal_pose = self._optimization_target_pose()
+            displacement = goal_pose.translation - self.cartesian_path_start_pose.translation
             self.cartesian_path_speed = self._cartesian_speed_limit(q, displacement)
             distance = float(np.linalg.norm(displacement))
             rotation_delta = self.pin.log3(
-                self.cartesian_path_start_pose.rotation.T @ self.target_pose.rotation
+                self.cartesian_path_start_pose.rotation.T @ goal_pose.rotation
             )
             rotation_angle = float(np.linalg.norm(rotation_delta))
             self.cartesian_path_duration = max(
@@ -1027,7 +1083,7 @@ class CrocoddylMPCNode(Node):
                 np.linalg.norm(segment_error(
                     current_pose.translation,
                     self.cartesian_path_start_pose.translation,
-                    self.target_pose.translation,
+                    goal_pose.translation,
                 )[0])
             )
 
@@ -1036,14 +1092,21 @@ class CrocoddylMPCNode(Node):
         ):
             action.update_target(reference_pose)
             action.update_path(
-                self.cartesian_path_start_pose.translation, self.target_pose.translation
+                self.cartesian_path_start_pose.translation,
+                self._optimization_target_pose().translation,
             )
         self.terminal_action.update_target(self.cartesian_reference_poses[-1])
         self.terminal_action.update_path(
-            self.cartesian_path_start_pose.translation, self.target_pose.translation
+            self.cartesian_path_start_pose.translation,
+            self._optimization_target_pose().translation,
         )
 
     def _on_target_pose(self, message: PoseStamped) -> None:
+        if self.vive_control is not None and self.vive_control.following:
+            return
+        self._apply_target_pose(message)
+
+    def _apply_target_pose(self, message: PoseStamped) -> None:
         if message.header.frame_id and message.header.frame_id != self.pose_frame:
             self.get_logger().warn(
                 f"teleop pose frame '{message.header.frame_id}'를 '{self.pose_frame}'로 변환할 TF가 없습니다. 무시합니다.",
@@ -1081,10 +1144,11 @@ class CrocoddylMPCNode(Node):
         ):
             seed = self.latest_state[: self.model.nq] if self.latest_state is not None else self.sim_q
             current_pose = self._tcp_pose(seed).copy()
+            mpc_target = self._optimization_target_pose(new_target)
             new_deviation = np.linalg.norm(segment_error(
                 current_pose.translation,
                 self.cartesian_path_start_pose.translation,
-                new_target.translation,
+                mpc_target.translation,
             )[0])
             if (
                 update_now - self.cartesian_path_start_time >= self.cartesian_path_duration
@@ -1114,7 +1178,22 @@ class CrocoddylMPCNode(Node):
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
         seed = self.latest_state[:6] if self.latest_state is not None else self.sim_q
-        self.xref = np.r_[self._solve_ik(self.target_pose, seed), np.zeros(self.model.nv)]
+        self.xref = np.r_[self._solve_ik(self._optimization_target_pose(), seed), np.zeros(self.model.nv)]
+
+    def _optimization_target_pose(self, desired=None):
+        """Project an infeasible desired goal for MPC while preserving its input pose."""
+        target = (self.target_pose if desired is None else desired).copy()
+        if self.workspace_floor_enabled:
+            target.translation[2] = max(
+                target.translation[2], self.workspace_min_z + self.workspace_floor_margin
+            )
+        return target
+
+    def _below_workspace_floor(self, q):
+        return self.workspace_floor_enabled and float(self._tcp_pose(q).translation[2]) < self.workspace_min_z
+
+    def _command_guard(self):
+        return self.workspace_floor_guard or self.cartesian_path_guard
 
     def _tcp_pose(self, q: np.ndarray):
         self.pin.framesForwardKinematics(self.model, self.pose_data, q)
@@ -1170,7 +1249,11 @@ class CrocoddylMPCNode(Node):
             float(message.header.stamp.sec)
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
-        if self.simulate and not self.internal_simulation and self.latest_state is not None:
+        if self.simulate and not self.internal_simulation and not self.execution_enabled:
+            # A paused alignment teleports the mock plant. That reset must not
+            # become a large finite-difference velocity at the next F7 start.
+            velocity = np.zeros(self.model.nv)
+        elif self.simulate and not self.internal_simulation and self.latest_state is not None:
             elapsed = state_stamp_s - self.last_state_stamp_s
             if elapsed > 1.0e-6:
                 # Average the mock servo's position jumps across the samples we actually consume.
@@ -1219,6 +1302,9 @@ class CrocoddylMPCNode(Node):
         if not self.simulate:
             acknowledge(False, "MPC is not in simulation mode.")
             return
+        if self.vive_control is not None and self.vive_control.following:
+            acknowledge(False, "Pause Vive following before syncing a robot joint pose.")
+            return
         if self.control_mode != "task_space":
             acknowledge(False, "Desired pose sync is available only in task_space control mode.")
             return
@@ -1236,6 +1322,10 @@ class CrocoddylMPCNode(Node):
             target_q > self.model.upperPositionLimit - 0.01
         ):
             acknowledge(False, "The sync target is outside or too close to a URDF joint limit.")
+            return
+
+        if self._below_workspace_floor(target_q):
+            acknowledge(False, f"Robot alignment rejected: {self.task_frame} is below world Z={self.workspace_min_z:.3f} m.")
             return
 
         now = time.monotonic()
@@ -1265,6 +1355,19 @@ class CrocoddylMPCNode(Node):
             float(message.header.stamp.sec)
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
+        if not self.execution_enabled:
+            # Align the mock plant while paused, before F6 enables physical
+            # output. This command remains on the simulation-only boundary.
+            self.cartesian_path_start_pose = target_pose.copy()
+            self._paused_alignment_target = target_q.copy()
+            self._paused_alignment_deadline = now + 2.0
+            self._publish_joint_command(target_q)
+            if self.internal_simulation:
+                self.sim_q = target_q.copy()
+                self.sim_v.fill(0.0)
+                self.sim_acceleration.fill(0.0)
+                self.latest_state = np.r_[self.sim_q, self.sim_v]
+                self._publish_sim_state()
         self._publish_target_pose()
         self.get_logger().info("Desired TCP pose synchronized from mapped robot joint state.")
         acknowledge(True, "Applied the desired pose computed from the robot joint posture.")
@@ -1306,7 +1409,7 @@ class CrocoddylMPCNode(Node):
             q_cmd = self._safe_joint_command(self.stationary_hold_q, state)
         else:
             q_cmd = self._safe_joint_command(state[: self.model.nq], state)
-        guard_success = not bool(self.cartesian_path_guard)
+        guard_success = not bool(self._command_guard())
         if not guard_success:
             self.stationary_hold_active = False
         current_pose = self._tcp_pose(state[: self.model.nq]).copy()
@@ -1317,7 +1420,7 @@ class CrocoddylMPCNode(Node):
         self.solve_time_pub.publish(Float64(data=0.0))
         self.solve_iterations_pub.publish(Float64(data=0.0))
         self.solve_success_pub.publish(Float64(data=1.0))
-        self.status_pub.publish(String(data=self.cartesian_path_guard or "stationary_hold"))
+        self.status_pub.publish(String(data=self._command_guard() or "stationary_hold"))
         self.control_norm_pub.publish(Float64(data=0.0))
         self.task_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error))))
         self.position_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error[:3]))))
@@ -1329,7 +1432,7 @@ class CrocoddylMPCNode(Node):
         self._publish_qref()
         self.solve_count += 1
         self._write_diagnostic(
-            status=self.cartesian_path_guard or "stationary_hold",
+            status=self._command_guard() or "stationary_hold",
             state=state,
             target=self.target_pose,
             solver_success=True,
@@ -1344,6 +1447,42 @@ class CrocoddylMPCNode(Node):
         )
         self._publish_command_pose(q_cmd)
 
+    def _set_execution_enabled(self, enabled):
+        self.execution_enabled = bool(enabled)
+        self._paused_alignment_target = None
+        if self.latest_state is None:
+            return
+        q = self.latest_state[:self.model.nq].copy()
+        current = self._tcp_pose(q).copy()
+        self.target_pose = current
+        self.previous_target_pose = current.copy()
+        self.cartesian_path_start_pose = current.copy()
+        self.cartesian_path_start_time = time.monotonic()
+        self.cartesian_path_duration = self.cartesian_min_duration
+        self.cartesian_path_progress = 0.0
+        self.xref = np.r_[q, np.zeros(self.model.nv)]
+        self.xs = [self.xref.copy() for _ in range(self.horizon + 1)]
+        self.us = [np.zeros(self.model.nv) for _ in range(self.horizon)]
+        self.stationary_hold_active = False
+        self.target_update_count += 1
+        if not enabled:
+            self.sim_v.fill(0.0)
+            self.sim_acceleration.fill(0.0)
+            if time.monotonic() - self.last_state_update_monotonic <= 0.5:
+                self._publish_joint_command(q)
+
+    def _publish_paused(self):
+        now = time.monotonic()
+        if now - self._last_paused_publish < 0.1:
+            return
+        self._last_paused_publish = now
+        self._publish_pose(self.current_pose_pub, self._tcp_pose(self.latest_state[:self.model.nq]))
+        self._publish_target_pose()
+        self._publish_qref()
+        self.status_pub.publish(String(data="paused_waiting_for_f7"))
+        if self.internal_simulation:
+            self._publish_sim_state()
+
     def _solve_once(self) -> None:
         if self.internal_simulation:
             self.latest_state = np.r_[self.sim_q, self.sim_v]
@@ -1355,14 +1494,40 @@ class CrocoddylMPCNode(Node):
                 self.warned_no_state = True
             return
 
+        if self.vive_control is not None:
+            self.vive_control.before_solve()
+        if not self.execution_enabled:
+            if self._paused_alignment_target is not None:
+                if (time.monotonic() > self._paused_alignment_deadline
+                        or np.allclose(self.latest_state[:self.model.nq], self._paused_alignment_target,
+                                       rtol=0, atol=1e-5)):
+                    self._paused_alignment_target = None
+                else:
+                    # Repeat until measured feedback confirms application;
+                    # the controller/subscription may still be activating.
+                    self._publish_joint_command(self._paused_alignment_target)
+            self._publish_paused()
+            return
+
         state = self.latest_state.copy()
+        if self._below_workspace_floor(state[:self.model.nq]):
+            self._publish_joint_command(state[:self.model.nq])
+            self.solve_success_pub.publish(Float64(data=0.0))
+            self.status_pub.publish(String(data="workspace_floor_violation"))
+            self.get_logger().error(
+                f"Measured {self.task_frame} is below world Z={self.workspace_min_z:.3f} m; holding joints.",
+                throttle_duration_sec=2.0,
+            )
+            return
         if not self.cartesian_path_initialized_from_state:
             self.cartesian_path_start_pose = self._tcp_pose(state[: self.model.nq]).copy()
             self.cartesian_path_start_time = time.monotonic()
             self.cartesian_path_initialized_from_state = True
         self._update_cartesian_references(state[: self.model.nq])
         if self.simulate and self.control_mode == "task_space" and not self.stationary_hold_active:
-            pose_error = self._pose_error(state[: self.model.nq], self.target_pose, self.pose_data)
+            pose_error = self._pose_error(
+                state[: self.model.nq], self._optimization_target_pose(), self.pose_data
+            )
             # The ideal position servo can stop on the measured pose without another torque solve.
             if (
                 np.linalg.norm(pose_error[:3]) <= self.stationary_hold_position_tolerance
@@ -1439,6 +1604,9 @@ class CrocoddylMPCNode(Node):
         raw_control = np.asarray(self.us[0], dtype=float).copy()
         current_pose = self._tcp_pose(state[:6]).copy()
         task_error = self._pose_error(state[:6], self.target_pose, self.pose_data)
+        optimization_error = self._pose_error(
+            state[:6], self._optimization_target_pose(), self.pose_data
+        )
         jacobian = self._jacobian_record(state[:6], current_pose)
         cost_terms = self.running_action.cost_terms(state, raw_control)
         terminal_cost_terms = self.terminal_action.cost_terms(
@@ -1486,20 +1654,20 @@ class CrocoddylMPCNode(Node):
                 q_cmd = self._safe_joint_command(state[: self.model.nq], state)
         else:
             q_cmd = self._safe_joint_command(next_state[: self.model.nq], state)
-        prediction_guard = prediction_guard or self.cartesian_path_guard
+        prediction_guard = prediction_guard or self._command_guard()
         self.last_q_cmd = q_cmd.copy()
         self._publish_joint_command(q_cmd)
         stationary_hold_ready = bool(
             stationary_optimum
             and not prediction_guard
-            and float(np.linalg.norm(task_error[:3]))
+            and float(np.linalg.norm(optimization_error[:3]))
             <= self.stationary_hold_position_tolerance
-            and float(np.linalg.norm(task_error[3:]))
+            and float(np.linalg.norm(optimization_error[3:]))
             <= self.stationary_hold_orientation_tolerance
         )
         solver_success = bool(solved or stationary_optimum)
         status = (
-            self.cartesian_path_guard
+            self._command_guard()
             or ("prediction_guard_hold" if prediction_guard else "")
             or ("stationary_optimum" if stationary_optimum else "")
             or ("solved" if solved else "not_converged")
@@ -1566,9 +1734,10 @@ class CrocoddylMPCNode(Node):
             raise RuntimeError("joint-position safety filter produced a non-finite command")
         self.cartesian_command_scale = 1.0
         self.cartesian_path_guard = ""
+        self.workspace_floor_guard = ""
         if self.control_mode == "task_space":
             start = self.cartesian_path_start_pose.translation
-            goal = self.target_pose.translation
+            goal = self._optimization_target_pose().translation
             deviation = float(np.linalg.norm(segment_error(
                 self._tcp_pose(measured_q).translation, start, goal
             )[0]))
@@ -1596,6 +1765,17 @@ class CrocoddylMPCNode(Node):
                 self.cartesian_path_guard = "cartesian_path_hold"
             elif self.cartesian_command_scale < 1.0 or not np.array_equal(command, original_command):
                 self.cartesian_path_guard = "cartesian_path_limited"
+        if self.workspace_floor_enabled:
+            command, scale = limit_height_step(
+                measured_q, command, lambda q: self._tcp_pose(q).translation.copy(),
+                self._tcp_position_jacobian, self.workspace_min_z, self.cartesian_reach_bound,
+            )
+            if self._below_workspace_floor(measured_q):
+                self.workspace_floor_guard = "workspace_floor_violation"
+            elif scale == 0.0:
+                self.workspace_floor_guard = "workspace_floor_hold"
+            elif scale < 1.0:
+                self.workspace_floor_guard = "workspace_floor_limited"
         return command
 
     def _tcp_position_jacobian(self, q: np.ndarray) -> np.ndarray:

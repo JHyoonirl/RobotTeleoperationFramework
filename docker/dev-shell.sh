@@ -6,7 +6,8 @@ if [[ $# -lt 3 ]]; then
     exit 2
 fi
 
-build_root=$1
+dev_root=$1
+build_root=$dev_root
 shift
 base_paths=()
 while (($#)) && [[ $1 != -- ]]; do
@@ -45,5 +46,9 @@ if [[ ! -f "$build_root/install/setup.bash" || "${FORCE_COLCON_BUILD:-0}" == 1 ]
 fi
 
 source "$build_root/install/setup.bash"
+# RViz must save into the writable development mount, not its installed
+# (possibly symlinked/read-only) package config. A directory permits Qt's
+# temporary-file + rename save operation and survives container recreation.
+export INDY7_RVIZ_CONFIG="${INDY7_RVIZ_CONFIG:-$dev_root/rviz/indy7.rviz}"
 cd /workspace
 exec "$@"

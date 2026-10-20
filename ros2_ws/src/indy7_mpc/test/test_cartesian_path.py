@@ -83,6 +83,13 @@ def node():
     node.model, node.state = model, crocoddyl.StateMultibody(model)
     node.frame_id, node.pose_data = model.getFrameId("tcp"), model.createData()
     node.control_mode = "task_space"
+    node.execution_enabled = True
+    node.vive_control = None
+    node.solve_count = 0
+    node.workspace_floor_enabled = True
+    node.workspace_min_z = 0.10
+    node.workspace_floor_margin = 0.001
+    node.workspace_floor_guard = ""
     node.dt = 0.02
     node.command_velocity_limits = np.ones(6)
     node.command_increment_limits = np.full(6, 0.02)
@@ -123,10 +130,12 @@ def test_joint_mode_keeps_existing_command_limits(node):
 
 @pytest.mark.parametrize("simulate, expected_velocity", [(True, 0.5), (False, 200.0)])
 @pytest.mark.parametrize("dt", [0.005, 0.01])
+@pytest.mark.parametrize("paused", [False, True])
 def test_mock_velocity_uses_consumed_sample_interval_and_real_feedback_is_preserved(
-    node, simulate, expected_velocity, dt
+    node, simulate, expected_velocity, dt, paused
 ):
     node.simulate = simulate
+    node.execution_enabled = not paused
     node.dt = dt
     node.internal_simulation = False
     node.joint_names = [f"joint{i}" for i in range(6)]
@@ -142,7 +151,7 @@ def test_mock_velocity_uses_consumed_sample_interval_and_real_feedback_is_preser
     # A mock position jump can produce a huge derivative on a short catch-up tick.
     message.velocity = [200.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     node._on_joint_state(message)
-    assert node.latest_state[6] == pytest.approx(expected_velocity)
+    assert node.latest_state[6] == pytest.approx(0.0 if simulate and paused else expected_velocity)
     assert node.last_state_stamp_s == pytest.approx(10.0 + 2.0 * dt)
 
 

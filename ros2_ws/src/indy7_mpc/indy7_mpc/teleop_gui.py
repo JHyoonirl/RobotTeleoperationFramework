@@ -34,8 +34,8 @@ ROBOT_JOINTS = [f"joint{i}" for i in range(6)]
 class TeleopRosNode(Node):
     """ROS bridge; publishers remain idle until the GUI explicitly enables them."""
 
-    def __init__(self, node_name="indy7_teleop_gui"):
-        super().__init__(node_name)
+    def __init__(self, node_name="indy7_teleop_gui", **kwargs):
+        super().__init__(node_name, **kwargs)
         self.declare_parameter("simulation_joint_state_topic", "/joint_states")
         self.declare_parameter("robot_joint_state_topic", "/indy7_dcp3/joint_states")
         self.declare_parameter("robot_command_topic", "/indy7_dcp3/joint_position_cmd")
@@ -85,8 +85,14 @@ class TeleopRosNode(Node):
             "service_time": 0.0,
             "stream_enabled": False,
             "deadman_held": False,
+            "deadman_gui_lease": False,
+            "deadman_gui_time": 0.0,
+            "sync_pending": False,
         }
         self.mapping = load_mapping(self.mapping_path, ROBOT_JOINTS, SIM_JOINTS)
+        self._managed_output = False
+        self._managed_follow = False
+        self._managed_hold = None
         self.command_pub = self.create_publisher(Float64MultiArray, self.command_topic, 10)
         self.deadman_pub = self.create_publisher(Bool, self.deadman_topic, 10)
         self.sync_pub = self.create_publisher(JointState, self.sync_topic, 10)
@@ -162,6 +168,7 @@ class TeleopRosNode(Node):
             return
         with self.lock:
             if result.get("request_id") == self.pending_sync_id:
+                self.state["sync_pending"] = False
                 self.state["sync_result"] = str(result.get("message", ""))
                 self.state["sync_time"] = time.monotonic()
                 self.state["sync_success"] = bool(result.get("success", False))
@@ -181,14 +188,34 @@ class TeleopRosNode(Node):
             self.state["stream_enabled"] = bool(enabled)
             if not enabled:
                 self.state["deadman_held"] = False
+                self._managed_output = self._managed_follow = False
+                self._managed_hold = None
         if not enabled:
             self.deadman_pub.publish(Bool(data=False))
 
     def set_deadman(self, held: bool) -> None:
         with self.lock:
+            self.state["deadman_gui_lease"] = False
             self.state["deadman_held"] = bool(held and self.state["stream_enabled"])
             active = self.state["deadman_held"]
         self.deadman_pub.publish(Bool(data=active))
+
+    def set_gui_deadman(self, held: bool) -> None:
+        """F6 sessions renew this from Qt, so a frozen GUI loses the lease."""
+        with self.lock:
+            self.state["deadman_gui_lease"] = True
+            self.state["deadman_gui_time"] = time.monotonic()
+            self.state["deadman_held"] = bool(held and self.state["stream_enabled"])
+            active = self.state["deadman_held"]
+        self.deadman_pub.publish(Bool(data=active))
+
+    def set_managed_follow(self, following: bool) -> None:
+        with self.lock:
+            if not self._managed_output or (self._managed_follow and not following):
+                self._managed_hold = (None if self.state["robot_q"] is None
+                                      else list(self.state["robot_q"]))
+            self._managed_output = True
+            self._managed_follow = bool(following)
 
     def _stream_tick(self) -> None:
         with self.lock:
@@ -198,6 +225,11 @@ class TeleopRosNode(Node):
                 return
             sim_q = list(self.state["sim_q"])
             mapping = self.mapping
+            if self._managed_output and not self._managed_follow:
+                if self._managed_hold is None or time.monotonic() - self.state["robot_time"] > 0.3:
+                    return
+                self.command_pub.publish(Float64MultiArray(data=list(self._managed_hold)))
+                return
         try:
             command = map_sim_to_robot(sim_q, SIM_JOINTS, ROBOT_JOINTS, mapping)
         except (KeyError, TypeError, ValueError):
@@ -207,10 +239,16 @@ class TeleopRosNode(Node):
     def _deadman_tick(self) -> None:
         with self.lock:
             held = bool(self.state["deadman_held"] and self.state["stream_enabled"])
+            expired = bool(held and self.state["deadman_gui_lease"]
+                           and time.monotonic() - self.state["deadman_gui_time"] > 0.2)
+            if expired:
+                self.state["deadman_held"] = held = False
         if held:
             self.deadman_pub.publish(Bool(data=True))
+        elif expired:
+            self.deadman_pub.publish(Bool(data=False))
 
-    def arm(self, armed: bool) -> None:
+    def arm(self, armed: bool):
         if not self.arm_client.service_is_ready():
             with self.lock:
                 self.state["service_result"] = "DCP3 arm service is unavailable."
@@ -231,6 +269,7 @@ class TeleopRosNode(Node):
                 self.state["service_time"] = time.monotonic()
 
         future.add_done_callback(complete)
+        return future
 
     def sync_robot_to_sim(self) -> str:
         with self.lock:
@@ -250,6 +289,7 @@ class TeleopRosNode(Node):
             self.pending_sync_id = request_id
             self.state["sync_result"] = "Simulation sync request sent; waiting for MPC response."
             self.state["sync_success"] = False
+            self.state["sync_pending"] = True
             self.state["sync_time"] = time.monotonic()
         self.sync_pub.publish(message)
         return request_id

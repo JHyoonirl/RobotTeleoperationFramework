@@ -25,8 +25,8 @@ TELE_JOINT_ABSOLUTE = 10
 class Indy7Dcp3Node(Node):
     """Read robot state continuously; only move after arm plus a live deadman."""
 
-    def __init__(self) -> None:
-        super().__init__("indy7_dcp3")
+    def __init__(self, *, client_factory=None, **kwargs) -> None:
+        super().__init__("indy7_dcp3", **kwargs)
         self.declare_parameter("robot_ip", "")
         self.declare_parameter("joint_state_topic", "/indy7_dcp3/joint_states")
         self.declare_parameter("command_topic", "/indy7_dcp3/joint_position_cmd")
@@ -83,13 +83,15 @@ class Indy7Dcp3Node(Node):
         if np.any(self.lower + self.limit_margin >= self.upper - self.limit_margin):
             raise ValueError("joint_limit_margin leaves no usable joint range")
 
-        try:
-            from neuromeka import IndyDCP3
-        except ImportError as exc:
-            raise RuntimeError(
-                "Neuromeka DCP3 client is missing; install the 'neuromeka' Python package"
-            ) from exc
-        self.client = IndyDCP3(self.robot_ip)
+        if client_factory is None:
+            try:
+                from neuromeka import IndyDCP3
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Neuromeka DCP3 client is missing; install the 'neuromeka' Python package"
+                ) from exc
+            client_factory = IndyDCP3
+        self.client = client_factory(self.robot_ip)
 
         self.armed = False
         self.arming = False
