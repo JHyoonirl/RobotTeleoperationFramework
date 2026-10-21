@@ -10,7 +10,10 @@ from pathlib import Path
 import numpy as np
 
 
-COST_NAMES = ("se3_tracking", "cartesian_path", "posture", "velocity", "torque", "joint_limit")
+COST_NAMES = (
+    "se3_tracking", "cartesian_path", "workspace_floor", "posture",
+    "velocity", "torque", "joint_limit",
+)
 
 
 def _number(value, default=np.nan):

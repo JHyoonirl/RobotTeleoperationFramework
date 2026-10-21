@@ -9,6 +9,7 @@ indy7_dcp3:
     publish_rate: 400.0
     command_timeout: 0.30
     deadman_timeout: 0.30
+    rpc_timeout: 0.10
     joint_limit_margin: 0.05
     # DCP3 motion ratios are sent as 0-100 values (20.0 means 20%).
     velocity_ratio: 0.7

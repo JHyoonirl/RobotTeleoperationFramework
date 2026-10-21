@@ -4,7 +4,7 @@ import math
 import time
 
 from .joint_mapping import map_sim_to_robot
-from .teleop_gui import ROBOT_JOINTS, SIM_JOINTS
+from .teleop_ros_node import ROBOT_JOINTS, SIM_JOINTS
 
 
 class RobotConnection:

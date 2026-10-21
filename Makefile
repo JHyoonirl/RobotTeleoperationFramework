@@ -12,8 +12,7 @@ DOCKER_TAG := mpc
 INDY7_SERVICE ?= mpc
 FORCE_COLCON_BUILD ?= 0
 DOCKER_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
-	/workspace/ros2_ws/src/indy7_mpc \
-	/workspace/ros2_ws/src/vive_tracker_ros2
+	/workspace/ros2_ws/src/indy7_mpc
 DOCKER_DCP3_BASE_PATHS := /workspace/ros2_ws/src/indy7_description \
 	/workspace/ros2_ws/src/indy7_dcp3
 
@@ -72,7 +71,10 @@ docker-check-indy7:
 		bash -lc 'set -e; source /opt/ros/jazzy/setup.bash; source /opt/robot-teleoperation-venv/bin/activate; cd /workspace/ros2_ws; python3 -m colcon --log-base /tmp/indy7_dcp3_ws/log build --symlink-install --merge-install --base-paths /workspace/ros2_ws/src/indy7_description /workspace/ros2_ws/src/indy7_dcp3 --build-base /tmp/indy7_dcp3_ws/build --install-base /tmp/indy7_dcp3_ws/install; source /tmp/indy7_dcp3_ws/install/setup.bash; exec ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$$INDY7_ROBOT_IP'
 
 docker-test:
-	docker run --rm $(DOCKER_IMAGE):$(DOCKER_TAG) python3 -m colcon test-result --verbose
+	docker buildx build --load --target mpc-test \
+		-f docker/Dockerfile -t $(DOCKER_IMAGE):mpc-test .
+	$(MAKE) docker-build-dcp3 DOCKER_IMAGE=$(DOCKER_IMAGE)
+	docker run --rm $(DOCKER_IMAGE):mpc-test bash -lc 'source /opt/ros/jazzy/setup.bash; source /opt/robot-teleoperation-venv/bin/activate; source /opt/robot_teleoperation_framework/install/setup.bash; python3 -m colcon test-result --verbose'
 	docker run --rm $(DOCKER_IMAGE):dcp3 python3 -m colcon test-result --verbose
 
 docker-run:

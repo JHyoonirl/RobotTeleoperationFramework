@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import functools
 import time
 from pathlib import Path
 
@@ -38,6 +39,7 @@ class Indy7Dcp3Node(Node):
         self.declare_parameter("publish_rate", 200.0)
         self.declare_parameter("command_timeout", 0.30)
         self.declare_parameter("deadman_timeout", 0.30)
+        self.declare_parameter("rpc_timeout", 0.10)
         self.declare_parameter("joint_limit_margin", 0.05)
         self.declare_parameter("velocity_ratio", 0.1)
         self.declare_parameter("acceleration_ratio", 1.0)
@@ -59,6 +61,7 @@ class Indy7Dcp3Node(Node):
         self.period = 1.0 / self.publish_rate if self.publish_rate > 0.0 else 0.0
         self.command_timeout = float(self.get_parameter("command_timeout").value)
         self.deadman_timeout = float(self.get_parameter("deadman_timeout").value)
+        self.rpc_timeout = float(self.get_parameter("rpc_timeout").value)
         self.limit_margin = float(self.get_parameter("joint_limit_margin").value)
         self.velocity_ratio = percent_ratio(
             self.get_parameter("velocity_ratio").value, "velocity_ratio"
@@ -71,6 +74,8 @@ class Indy7Dcp3Node(Node):
             or not math.isfinite(self.period)
             or self.command_timeout <= 0.0
             or self.deadman_timeout <= 0.0
+            or self.rpc_timeout <= 0.0
+            or self.rpc_timeout >= min(self.command_timeout, self.deadman_timeout)
             or not math.isfinite(self.command_timeout)
             or not math.isfinite(self.deadman_timeout)
             or self.limit_margin < 0.0
@@ -83,6 +88,7 @@ class Indy7Dcp3Node(Node):
         if np.any(self.lower + self.limit_margin >= self.upper - self.limit_margin):
             raise ValueError("joint_limit_margin leaves no usable joint range")
 
+        install_rpc_deadlines = client_factory is None
         if client_factory is None:
             try:
                 from neuromeka import IndyDCP3
@@ -92,6 +98,8 @@ class Indy7Dcp3Node(Node):
                 ) from exc
             client_factory = IndyDCP3
         self.client = client_factory(self.robot_ip)
+        if install_rpc_deadlines:
+            self._install_rpc_deadlines(self.client, self.rpc_timeout)
 
         self.armed = False
         self.arming = False
@@ -137,6 +145,31 @@ class Indy7Dcp3Node(Node):
 
     def _deadman_is_live(self, now: float) -> bool:
         return self.deadman_value and now - self.last_deadman_time <= self.deadman_timeout
+
+    @staticmethod
+    def _install_rpc_deadlines(client, timeout: float) -> None:
+        """Bound synchronous Neuromeka gRPC calls so ROS watchdog callbacks resume."""
+        methods = {
+            "rtde": ("GetControlData",),
+            "control": ("StartTeleOp", "MoveTeleJ", "StopMotion", "StopTeleOp"),
+        }
+        for stub_name, method_names in methods.items():
+            stub = getattr(client, stub_name, None)
+            if stub is None:
+                raise RuntimeError(f"Neuromeka client is missing the {stub_name} RPC stub")
+            for method_name in method_names:
+                method = getattr(stub, method_name, None)
+                if method is None:
+                    raise RuntimeError(
+                        f"Neuromeka client does not expose the {stub_name}.{method_name} RPC"
+                    )
+
+                @functools.wraps(method)
+                def call_with_deadline(*args, _method=method, **kwargs):
+                    kwargs.setdefault("timeout", timeout)
+                    return _method(*args, **kwargs)
+
+                setattr(stub, method_name, call_with_deadline)
 
     def _on_arm(self, request: SetBool.Request, response: SetBool.Response):
         if not request.data:

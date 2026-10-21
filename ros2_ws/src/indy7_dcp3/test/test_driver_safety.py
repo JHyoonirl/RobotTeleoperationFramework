@@ -1,6 +1,8 @@
 import numpy as np
 import pytest
+from types import SimpleNamespace
 
+from indy7_dcp3.driver_node import Indy7Dcp3Node
 from indy7_dcp3.safety import percent_ratio, validate_joint_target
 
 
@@ -51,3 +53,45 @@ def test_dcp3_motion_ratio_accepts_percent_range(value, name):
 def test_dcp3_motion_ratio_rejects_values_outside_percent_range(value):
     with pytest.raises(ValueError, match="velocity_ratio.*0 to 100"):
         percent_ratio(value, "velocity_ratio")
+
+
+def test_vendor_rpc_calls_receive_bounded_deadlines():
+    class Stub:
+        def __init__(self, methods):
+            self.calls = {}
+            for name in methods:
+                setattr(self, name, self._record(name))
+
+        def _record(self, name):
+            def call(*args, **kwargs):
+                self.calls[name] = (args, kwargs)
+                return "ok"
+            return call
+
+    rtde = Stub(("GetControlData",))
+    control = Stub(("StartTeleOp", "MoveTeleJ", "StopMotion", "StopTeleOp"))
+    client = SimpleNamespace(rtde=rtde, control=control)
+    Indy7Dcp3Node._install_rpc_deadlines(client, 0.1)
+
+    assert rtde.GetControlData("request") == "ok"
+    assert control.StartTeleOp("request", timeout=0.2) == "ok"
+    assert control.MoveTeleJ("request") == "ok"
+    assert control.StopMotion("request") == "ok"
+    assert control.StopTeleOp("request") == "ok"
+    assert rtde.calls["GetControlData"][1]["timeout"] == 0.1
+    assert control.calls["StartTeleOp"][1]["timeout"] == 0.2
+    assert all(control.calls[name][1]["timeout"] == 0.1
+               for name in ("MoveTeleJ", "StopMotion", "StopTeleOp"))
+
+
+def test_deadline_wrapper_can_be_installed_on_neuromeka_grpc_stubs():
+    neuromeka = pytest.importorskip("neuromeka")
+    client = neuromeka.IndyDCP3("127.0.0.1")
+    Indy7Dcp3Node._install_rpc_deadlines(client, 0.1)
+
+    assert callable(client.rtde.GetControlData)
+    assert callable(client.control.StartTeleOp)
+    assert callable(client.control.MoveTeleJ)
+    assert callable(client.control.StopMotion)
+    assert callable(client.control.StopTeleOp)
+    assert hasattr(client.control.MoveTeleJ, "__wrapped__")

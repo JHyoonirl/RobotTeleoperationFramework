@@ -4,6 +4,7 @@ import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -21,6 +22,7 @@ from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from std_srvs.srv import SetBool
+from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
 pytest.importorskip("crocoddyl")
@@ -48,7 +50,10 @@ def session(monkeypatch, tmp_path):
     config.update({"urdf_path": str(description / "urdf/indy7.urdf"),
                    "simulate": True, "internal_simulation": True, "enable_vive_follow": True,
                    "initialize_target_from_current_state": True, "start_paused": True,
-                   "diagnostic_logging": False, "dt": 0.02, "horizon": 10})
+                   "diagnostic_logging": False, "dt": 0.02, "horizon": 10,
+                   # Tests exercise a stable contract independently of the operator's
+                   # runtime floor setting (currently tuned to 0.15 m).
+                   "workspace_min_z": 0.10, "workspace_floor_margin": 0.001})
     mpc = CrocoddylMPCNode(context=context, parameter_overrides=[
         Parameter(name, value=value) for name, value in config.items()])
     gui_node = TeleopRosNode("test_hand_modes_gui", context=context)
@@ -114,10 +119,14 @@ def session(monkeypatch, tmp_path):
 
 def test_keyboard_uses_hand_target_without_a_tracker(session):
     s = session
+    assert s.nodes[1].joint_command_rate == pytest.approx(200.0)
+    assert s.nodes[1]._stream_timer.timer_period_ns == 5_000_000
     assert not s.client.snapshot()["status_fresh"]  # No mapper or Tracker exists.
     assert not s.client.snapshot()["can_run_simulation"]
     s.select_mode("keyboard")
     s.wait_for(lambda: s.client.snapshot()["can_run_simulation"] and s.previews)
+
+
     assert not s.window.target_box.isVisible()  # No second, competing jog path.
     initial_hand, initial_q = s.current_hand(), s.mpc.sim_q.copy()
     np.testing.assert_allclose(s.client.snapshot()["keyboard_pose"][:3], initial_hand[:3, 3])
@@ -152,6 +161,33 @@ def test_keyboard_uses_hand_target_without_a_tracker(session):
     assert not s.window.target_box.isVisible()  # Stale status cannot enable the legacy input.
     QTest.keyClick(s.panel.translation_step, Qt.Key_W)
     assert not s.legacy_commands
+
+
+def test_mpc_stops_publishing_when_joint_feedback_is_stale(session):
+    mpc = session.mpc
+    mpc.internal_simulation = False
+    mpc.vive_control = None
+    mpc.execution_enabled = True
+    mpc.last_state_update_monotonic = time.monotonic() - mpc.joint_state_timeout - 0.1
+    mpc.status_pub = Mock()
+    mpc.solve_success_pub = Mock()
+    mpc.joint_command_pub = Mock()
+    mpc.solver.solve = Mock()
+
+    mpc._solve_once()
+
+    mpc.status_pub.publish.assert_called_once()
+    assert mpc.status_pub.publish.call_args.args[0].data == "joint_state_stale"
+    mpc.solve_success_pub.publish.assert_called_once()
+    mpc.joint_command_pub.publish.assert_not_called()
+    mpc.solver.solve.assert_not_called()
+
+
+def test_malformed_sync_ack_is_ignored(session):
+    gui = session.nodes[1]
+    before = gui.snapshot()
+    gui._on_sync_ack(String(data="[]"))
+    assert gui.snapshot() == before
 
 
 def test_topic_and_keyboard_inputs_cannot_override_each_other(session):

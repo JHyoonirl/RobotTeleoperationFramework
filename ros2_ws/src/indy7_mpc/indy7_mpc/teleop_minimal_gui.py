@@ -10,7 +10,7 @@ import time
 import rclpy
 
 from .joint_mapping import map_sim_to_robot, validate_mapping
-from .teleop_gui import ROBOT_JOINTS, SIM_JOINTS, TeleopRosNode
+from .teleop_ros_node import ROBOT_JOINTS, SIM_JOINTS, TeleopRosNode
 
 
 def create_window(node):

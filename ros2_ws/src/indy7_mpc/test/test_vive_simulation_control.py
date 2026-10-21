@@ -137,6 +137,10 @@ def test_f7_runs_mpc_without_robot_and_stops_on_input_loss():
     try:
         assert mpc.task_frame == "hand_tcp"
         assert mpc.get_parameter("task_frame").value == "hand_tcp"
+        assert isinstance(mpc.solver, mpc.crocoddyl.SolverBoxFDDP)
+        for action_model in mpc.problem.runningModels:
+            np.testing.assert_allclose(action_model.u_lb, -mpc.torque_limits)
+            np.testing.assert_allclose(action_model.u_ub, mpc.torque_limits)
         assert all(action.frame_id == hand_id for action in mpc.running_actions)
         assert mpc.terminal_action.frame_id == hand_id
         wait_for(lambda: client.snapshot()["simulation_fresh"] and client.snapshot()["can_sync"])
@@ -188,6 +192,8 @@ def test_f7_runs_mpc_without_robot_and_stops_on_input_loss():
         np.testing.assert_allclose(mpc.target_pose.homogeneous, desired_hand, atol=1e-8)
         wait_for(hand_reached_target)
         assert mpc.solve_count > 0 and commands
+        assert all(np.all(np.abs(control) <= mpc.torque_limits + 1.0e-8)
+                   for control in mpc.solver.us)
         assert np.linalg.norm(mpc.sim_q - initial_q) > 1e-3
         assert np.linalg.norm(pin.log3(current_hand()[:3, :3].T @ desired_hand[:3, :3])) < 0.02
         assert not peer.get_publishers_info_by_topic("/indy7_dcp3/joint_position_cmd")

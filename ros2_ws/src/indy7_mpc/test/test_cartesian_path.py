@@ -1,6 +1,7 @@
 """Geometry, continuous-step bounds and the actual post-clipping command guard."""
 
 from pathlib import Path
+import time
 from unittest.mock import Mock
 
 import crocoddyl
@@ -86,6 +87,11 @@ def node():
     node.execution_enabled = True
     node.vive_control = None
     node.solve_count = 0
+    node.joint_state_timeout = 0.5
+    node.last_state_update_monotonic = time.monotonic()
+    node.diagnostic_period = 0.1
+    node._last_diagnostic_time = -float("inf")
+    node.diagnostic_ik_enabled = False
     node.workspace_floor_enabled = True
     node.workspace_min_z = 0.10
     node.workspace_floor_margin = 0.001
@@ -239,6 +245,10 @@ def test_recorded_boundary_stall_can_move_inward(node):
 
 
 @pytest.mark.parametrize("status, success, label", [
+    ("workspace_floor_limited", 1.0, "FLOOR LIMITED"),
+    ("workspace_floor_hold", 0.0, "FLOOR HOLD"),
+    ("workspace_floor_violation", 0.0, "FLOOR VIOLATION | HOLD"),
+    ("joint_state_stale", 0.0, "JOINT STATE STALE"),
     ("cartesian_path_limited", 1.0, "PATH LIMITED"),
     ("cartesian_path_hold", 1.0, "PATH HOLD"),
     ("cartesian_path_violation", 1.0, "PATH VIOLATION | HOLD"),
@@ -287,7 +297,7 @@ def test_identical_target_does_not_reanchor_an_expired_path(node):
     node.last_target_update_monotonic = 0.0
     node.previous_target_pose = None
     node.target_update_count = 0
-    node._solve_ik = lambda target, seed: seed.copy()
+    node._solve_ik = Mock(side_effect=lambda target, seed: seed.copy())
     message = PoseStamped()
     message.header.frame_id = "world"
     position = node.target_pose.translation
@@ -297,8 +307,21 @@ def test_identical_target_does_not_reanchor_an_expired_path(node):
      message.pose.orientation.z, message.pose.orientation.w) = orientation
     original_start = node.cartesian_path_start_pose.copy()
     node._on_target_pose(message)
+    node._solve_ik.assert_not_called()
     np.testing.assert_array_equal(node.cartesian_path_start_pose.translation, original_start.translation)
     assert node.cartesian_path_start_time == 0.0
+
+
+def test_diagnostic_work_is_rate_limited(node, monkeypatch):
+    current_time = [5.0]
+    node.diagnostic_period = 0.1
+    node._last_diagnostic_time = 4.95
+    monkeypatch.setattr("indy7_mpc.crocoddyl_mpc_node.time.monotonic", lambda: current_time[0])
+
+    assert not node._diagnostics_due()
+    current_time[0] = 5.06
+    assert node._diagnostics_due()
+    assert not node._diagnostics_due()
 
 
 @pytest.mark.parametrize("translation, rotation", [

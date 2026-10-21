@@ -43,28 +43,42 @@ RUN python3 -m venv --system-site-packages "$VIRTUAL_ENV"
 WORKDIR /opt/robot_teleoperation_framework
 
 COPY robots/indy7/requirements-mpc.txt /tmp/requirements-mpc.txt
+COPY robots/indy7/requirements-mpc-constraints.txt /tmp/requirements-mpc-constraints.txt
 RUN python3 -m pip install --no-cache-dir \
+        --constraint /tmp/requirements-mpc-constraints.txt \
         -r /tmp/requirements-mpc.txt \
-    && rm /tmp/requirements-mpc.txt
+    && rm /tmp/requirements-mpc.txt /tmp/requirements-mpc-constraints.txt
 
 COPY robots/indy7/indy7_mpc_test.py ./indy7_mpc_test.py
 COPY ros2_ws/src/indy7_description ./src/indy7_description
 COPY ros2_ws/src/indy7_mpc ./src/indy7_mpc
-COPY ros2_ws/src/vive_tracker_ros2 ./src/vive_tracker_ros2
+
+RUN source /opt/ros/jazzy/setup.bash \
+    && python3 -m colcon build --merge-install \
+        --base-paths /opt/robot_teleoperation_framework/src/indy7_description \
+            /opt/robot_teleoperation_framework/src/indy7_mpc
+
+CMD ["ros2", "launch", "indy7_mpc", "indy7_mpc.launch.py", "rviz:=false", "plot:=false"]
+
+FROM mpc AS mpc-test
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3-pyqt5 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY ros2_ws/src/indy7_dcp3 ./src/indy7_dcp3
 
 RUN source /opt/ros/jazzy/setup.bash \
     && python3 -m colcon build --merge-install \
         --base-paths /opt/robot_teleoperation_framework/src/indy7_description \
             /opt/robot_teleoperation_framework/src/indy7_mpc \
-            /opt/robot_teleoperation_framework/src/vive_tracker_ros2 \
+            /opt/robot_teleoperation_framework/src/indy7_dcp3 \
     && source /opt/robot_teleoperation_framework/install/setup.bash \
     && python3 -m colcon test --merge-install \
-        --packages-select indy7_description indy7_mpc vive_tracker_ros \
+        --packages-select indy7_description indy7_mpc \
         --python-testing pytest --pytest-args " --ignore=third_party" \
         --event-handlers console_direct+ \
     && python3 -m colcon test-result --verbose
-
-CMD ["ros2", "launch", "indy7_mpc", "indy7_mpc.launch.py", "rviz:=false", "plot:=false"]
 
 FROM mpc AS mpc-gui
 

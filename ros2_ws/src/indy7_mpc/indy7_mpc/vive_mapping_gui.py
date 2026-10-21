@@ -460,7 +460,7 @@ class ViveMappingPanel(QGroupBox):
 
 def main(args=None):
     from .robot_connection import RobotConnection
-    from .teleop_gui import TeleopRosNode
+    from .teleop_ros_node import TeleopRosNode
 
     rclpy.init(args=args)
     node = TeleopRosNode("indy7_vive_mapping_gui")

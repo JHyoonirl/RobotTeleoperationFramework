@@ -37,12 +37,14 @@ class MpcPlotter(Node):
                 "cost",
                 "se3_tracking",
                 "cartesian_path",
+                "workspace_floor",
                 "posture",
                 "velocity",
                 "torque",
                 "joint_limit",
                 "terminal_cost",
                 "solve_time_ms",
+                "callback_time_ms",
                 "solver_iterations",
                 "solver_success",
                 "control_norm",
@@ -61,12 +63,14 @@ class MpcPlotter(Node):
             "cost": "/mpc/cost",
             "se3_tracking": "/mpc/cost/se3_tracking",
             "cartesian_path": "/mpc/cost/cartesian_path",
+            "workspace_floor": "/mpc/cost/workspace_floor",
             "posture": "/mpc/cost/posture",
             "velocity": "/mpc/cost/velocity",
             "torque": "/mpc/cost/torque",
             "joint_limit": "/mpc/cost/joint_limit",
             "terminal_cost": "/mpc/terminal_cost",
             "solve_time_ms": "/mpc/solve_time_ms",
+            "callback_time_ms": "/mpc/callback_time_ms",
             "solver_iterations": "/mpc/solver_iterations",
             "solver_success": "/mpc/solver_success",
             "control_norm": "/mpc/control_norm",
@@ -105,6 +109,7 @@ class MpcPlotter(Node):
             "orientation_error": self.ax_orientation.plot([], [], label="orientation [deg]", color="tab:orange")[0],
             "cost": self.ax_cost.plot([], [], label="total cost", color="tab:red")[0],
             "solve_time_ms": self.ax_solver.plot([], [], label="solve time [ms]", color="tab:purple")[0],
+            "callback_time_ms": self.ax_solver.plot([], [], label="callback time [ms]", color="tab:red")[0],
             "solver_iterations": self.ax_iterations.plot([], [], label="iterations", color="tab:green")[0],
             "solver_success": self.ax_success.plot([], [], label="success", color="tab:cyan", drawstyle="steps-post")[0],
             "control_norm": self.ax_control.plot([], [], label="|tau|", color="tab:brown")[0],
@@ -256,6 +261,15 @@ class MpcPlotter(Node):
     def _status_label(status: str, success: float) -> tuple[str, str]:
         if status == "cartesian_path_violation":
             return "PATH VIOLATION | HOLD", "tab:red"
+        if status.startswith("workspace_floor_violation"):
+            return "FLOOR VIOLATION | HOLD", "tab:red"
+        if status.startswith("workspace_floor_hold"):
+            return "FLOOR HOLD", "tab:red"
+        if status.startswith("workspace_floor_limited"):
+            suffix = "" if success >= 0.5 else " | SOLVER NOT CONVERGED"
+            return "FLOOR LIMITED" + suffix, "tab:orange"
+        if status in {"joint_state_stale", "paused_joint_state_stale"}:
+            return "JOINT STATE STALE", "tab:red"
         if status == "cartesian_path_hold":
             return "PATH HOLD", "tab:orange"
         if status == "cartesian_path_limited":

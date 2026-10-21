@@ -12,7 +12,6 @@ from __future__ import annotations
 import ast
 import json
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -25,13 +24,14 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Float64MultiArray, String
 
 from .cartesian_path import limit_cartesian_step, project_cartesian_command, segment_error
+from .mpc_diagnostics import MpcDiagnosticsMixin
 from .mpc_cost_config import apply_runtime_cost_settings, load_runtime_cost_settings
 from .se3_dynamic_model import SE3DynamicActionModel
 from .vive_simulation_control import ViveSimulationControl
 from .workspace_floor import limit_height_step
 
 
-class CrocoddylMPCNode(Node):
+class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
     def __init__(self, **kwargs) -> None:
         super().__init__("indy7_crocoddyl_mpc", **kwargs)
         self.declare_parameter("urdf_path", "")
@@ -69,6 +69,7 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("hand_target_pose_topic", "/indy7/hand_target_pose")
         self.declare_parameter("hand_target_frame", "hand_target")
         self.declare_parameter("vive_input_timeout", 0.5)
+        self.declare_parameter("joint_state_timeout", 0.5)
         # Keep a deterministic local plant only for standalone smoke tests.
         # Normal simulation uses ros2_control and its joint_states topic.
         self.declare_parameter("internal_simulation", False)
@@ -94,8 +95,6 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("posture_cost_weight", 0.01)
         self.declare_parameter("velocity_cost_weight", 1.0)
         self.declare_parameter("torque_cost_weight", 0.0001)
-        # Kept for old YAML files; the dynamic model no longer optimizes qddot.
-        self.declare_parameter("acceleration_cost_weight", 0.05)
         self.declare_parameter("joint_limit_cost_weight", 10.0)
         self.declare_parameter("running_cost_weight", 1.0)
         self.declare_parameter("terminal_cost_weight", 10.0)
@@ -103,17 +102,17 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter(
             "torque_limits", [431.97, 431.97, 197.23, 79.79, 79.79, 79.79]
         )
-        self.declare_parameter("acceleration_limits", [20.0] * 6)
+        self.declare_parameter("diagnostic_acceleration_clip", [20.0] * 6)
         self.declare_parameter("ik_max_iterations", 80)
         self.declare_parameter("ik_damping", 0.001)
         self.declare_parameter("ik_step", 0.1)
-        self.declare_parameter("simulation_damping", 5.0)
-        self.declare_parameter("simulation_acceleration_smoothing", 0.25)
+        self.declare_parameter("diagnostic_ik_enabled", False)
         self.declare_parameter("diagnostic_logging", True)
+        self.declare_parameter("diagnostic_rate", 10.0)
         # Empty means <ros2_ws>/logs/indy7_mpc, next to src/install/build.
         self.declare_parameter("diagnostic_log_directory", "")
         self.declare_parameter("diagnostic_flush_period", 1.0)
-        self.declare_parameter("diagnostic_log_prediction", True)
+        self.declare_parameter("diagnostic_log_prediction", False)
         self.declare_parameter("stationary_hold_position_tolerance", 2.0e-4)
         self.declare_parameter("stationary_hold_orientation_tolerance", 1.5e-3)
 
@@ -151,6 +150,9 @@ class CrocoddylMPCNode(Node):
         if self.control_mode not in {"task_space", "joint"}:
             raise ValueError("control_mode는 task_space 또는 joint여야 합니다.")
         self.simulate = self._as_bool(self.get_parameter("simulate").value)
+        self.joint_state_timeout = float(self.get_parameter("joint_state_timeout").value)
+        if not np.isfinite(self.joint_state_timeout) or self.joint_state_timeout <= 0.0:
+            raise ValueError("joint_state_timeout must be positive and finite")
         self.vive_follow_enabled = self.simulate and self._as_bool(
             self.get_parameter("enable_vive_follow").value
         )
@@ -231,17 +233,14 @@ class CrocoddylMPCNode(Node):
         self.posture_cost_weight = float(self.get_parameter("posture_cost_weight").value)
         self.velocity_cost_weight = float(self.get_parameter("velocity_cost_weight").value)
         self.torque_cost_weight = float(self.get_parameter("torque_cost_weight").value)
-        self.acceleration_cost_weight = float(
-            self.get_parameter("acceleration_cost_weight").value
-        )
         self.joint_limit_cost_weight = float(
             self.get_parameter("joint_limit_cost_weight").value
         )
         self.running_cost_weight = float(self.get_parameter("running_cost_weight").value)
         self.terminal_cost_weight = float(self.get_parameter("terminal_cost_weight").value)
         self.joint_limit_margin = float(self.get_parameter("joint_limit_margin").value)
-        self.acceleration_limits = self._parse_vector(
-            self.get_parameter("acceleration_limits").value, 6
+        self.diagnostic_acceleration_clip = self._parse_vector(
+            self.get_parameter("diagnostic_acceleration_clip").value, 6
         )
         self.torque_limits = np.minimum(
             self._parse_vector(self.get_parameter("torque_limits").value, 6),
@@ -250,9 +249,8 @@ class CrocoddylMPCNode(Node):
         self.ik_max_iterations = int(self.get_parameter("ik_max_iterations").value)
         self.ik_damping = float(self.get_parameter("ik_damping").value)
         self.ik_step = float(self.get_parameter("ik_step").value)
-        self.simulation_damping = float(self.get_parameter("simulation_damping").value)
-        self.simulation_acceleration_smoothing = float(
-            self.get_parameter("simulation_acceleration_smoothing").value
+        self.diagnostic_ik_enabled = self._as_bool(
+            self.get_parameter("diagnostic_ik_enabled").value
         )
         self.diagnostic_logging = self._as_bool(
             self.get_parameter("diagnostic_logging").value
@@ -263,6 +261,11 @@ class CrocoddylMPCNode(Node):
         self.diagnostic_flush_period = float(
             self.get_parameter("diagnostic_flush_period").value
         )
+        self.diagnostic_rate = float(self.get_parameter("diagnostic_rate").value)
+        if not np.isfinite(self.diagnostic_rate) or self.diagnostic_rate <= 0.0:
+            raise ValueError("diagnostic_rate must be positive and finite")
+        self.diagnostic_period = 1.0 / self.diagnostic_rate
+        self._last_diagnostic_time = -float("inf")
         self.diagnostic_log_prediction = self._as_bool(
             self.get_parameter("diagnostic_log_prediction").value
         )
@@ -332,10 +335,6 @@ class CrocoddylMPCNode(Node):
             float(np.linalg.norm(placement.translation))
             for placement in self.model.jointPlacements
         ) + float(np.linalg.norm(self.model.frames[self.frame_id].placement.translation))
-        if self.simulation_damping < 0.0 or not np.isfinite(self.simulation_damping):
-            raise ValueError("simulation_damping은 0 이상인 유한값이어야 합니다.")
-        if not 0.0 < self.simulation_acceleration_smoothing <= 1.0:
-            raise ValueError("simulation_acceleration_smoothing은 (0, 1] 범위여야 합니다.")
         if self.diagnostic_flush_period <= 0.0 or not np.isfinite(self.diagnostic_flush_period):
             raise ValueError("diagnostic_flush_period는 양수인 유한값이어야 합니다.")
         if (
@@ -380,7 +379,11 @@ class CrocoddylMPCNode(Node):
             self._optimization_target_pose() for _ in range(self.horizon + 1)
         ]
         if self.control_mode == "task_space":
-            self.xref = np.r_[self._solve_ik(self._optimization_target_pose(), self.sim_q), np.zeros(self.model.nv)]
+            initial_qref = (
+                self._solve_ik(self._optimization_target_pose(), self.sim_q)
+                if self.diagnostic_ik_enabled else self.sim_q.copy()
+            )
+            self.xref = np.r_[initial_qref, np.zeros(self.model.nv)]
         else:
             self.xref = np.r_[self.goal, np.zeros(self.model.nv)]
         self.problem, self.solver = self._make_problem()
@@ -396,6 +399,8 @@ class CrocoddylMPCNode(Node):
         self.last_target_acceleration = np.zeros(self.model.nv)
         self.last_applied_acceleration = np.zeros(self.model.nv)
         self.last_dynamics: dict = {}
+        self.last_cost_terms: dict = {}
+        self.last_terminal_cost_terms: dict = {}
         self.last_q_cmd: np.ndarray | None = None
         self.stationary_hold_active = False
         self.stationary_hold_target_count = -1
@@ -433,6 +438,7 @@ class CrocoddylMPCNode(Node):
         self.position_error_pub = self.create_publisher(Float64, "mpc/position_error", 10)
         self.orientation_error_pub = self.create_publisher(Float64, "mpc/orientation_error", 10)
         self.solve_time_pub = self.create_publisher(Float64, "mpc/solve_time_ms", 10)
+        self.callback_time_pub = self.create_publisher(Float64, "mpc/callback_time_ms", 10)
         self.solve_iterations_pub = self.create_publisher(Float64, "mpc/solver_iterations", 10)
         self.solve_success_pub = self.create_publisher(Float64, "mpc/solver_success", 10)
         self.status_pub = self.create_publisher(String, "mpc/status", 10)
@@ -502,335 +508,6 @@ class CrocoddylMPCNode(Node):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-    def _open_diagnostic_log(self, urdf_path: Path) -> None:
-        """Create one self-contained JSONL trace and a parameter snapshot."""
-        if not self.diagnostic_logging:
-            return
-        try:
-            requested = self.diagnostic_log_directory.strip()
-            if requested:
-                root = Path(requested).expanduser()
-            else:
-                workspace = next(
-                    (
-                        parent
-                        for parent in (urdf_path.parent, *urdf_path.parents)
-                        if (parent / "src").is_dir() and (parent / "install").is_dir()
-                    ),
-                    Path.cwd(),
-                )
-                root = workspace / "logs" / "indy7_mpc"
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            run_dir = root / stamp
-            run_dir.mkdir(parents=True, exist_ok=False)
-            self._diagnostic_path = run_dir / "trace.jsonl"
-            self._diagnostic_file = self._diagnostic_path.open(
-                "w", encoding="utf-8", buffering=8192
-            )
-            parameter_names = (
-                "urdf_path",
-                "control_mode",
-                "task_frame",
-                "pose_frame",
-                "teleop_pose_topic",
-                "command_pose_topic",
-                "joint_command_topic",
-                "goal",
-                "nominal_posture",
-                "goal_position",
-                "goal_orientation_xyzw",
-                "horizon",
-                "dt",
-                "max_solver_iterations",
-                "simulate",
-                "initialize_target_from_current_state",
-                "internal_simulation",
-                "command_velocity_limits",
-                "command_increment_limits",
-                "workspace_floor_enabled",
-                "workspace_min_z",
-                "workspace_floor_margin",
-                "workspace_floor_cost_weight",
-                "cartesian_max_speed",
-                "cartesian_max_angular_speed",
-                "cartesian_speed_margin",
-                "cartesian_min_duration",
-                "cartesian_path_tolerance",
-                "cartesian_reference_topic",
-                "se3_position_cost_weight",
-                "se3_orientation_cost_weight",
-                "posture_cost_weight",
-                "velocity_cost_weight",
-                "torque_cost_weight",
-                "acceleration_cost_weight",
-                "joint_limit_cost_weight",
-                "running_cost_weight",
-                "terminal_cost_weight",
-                "joint_limit_margin",
-                "torque_limits",
-                "acceleration_limits",
-                "ik_max_iterations",
-                "ik_damping",
-                "ik_step",
-                "simulation_damping",
-                "simulation_acceleration_smoothing",
-                "diagnostic_logging",
-                "diagnostic_log_directory",
-                "diagnostic_flush_period",
-                "diagnostic_log_prediction",
-                "stationary_hold_position_tolerance",
-                "stationary_hold_orientation_tolerance",
-            )
-            parameters = {
-                name: self.get_parameter(name).value for name in parameter_names
-            }
-            parameters["urdf_path"] = str(urdf_path)
-            parameters["resolved_log_directory"] = str(root)
-            parameters["effective_torque_limits"] = self.torque_limits
-            parameters["urdf_effort_limits"] = np.asarray(self.model.effortLimit, dtype=float)
-            (run_dir / "parameters.json").write_text(
-                json.dumps(self._json_safe(parameters), indent=2, ensure_ascii=False)
-                + "\n",
-                encoding="utf-8",
-            )
-            self.get_logger().info(f"MPC diagnostic log: {self._diagnostic_path}")
-        except (OSError, TypeError, ValueError) as exc:
-            if self._diagnostic_file is not None:
-                self._diagnostic_file.close()
-            self.diagnostic_logging = False
-            self._diagnostic_file = None
-            self._diagnostic_path = None
-            self.get_logger().error(f"진단 로그를 열 수 없습니다: {exc}")
-
-    @staticmethod
-    def _json_safe(value):
-        if isinstance(value, np.ndarray):
-            return CrocoddylMPCNode._json_safe(value.tolist())
-        if isinstance(value, (np.floating, np.integer, np.bool_)):
-            value = value.item()
-        if isinstance(value, float):
-            return value if np.isfinite(value) else None
-        if isinstance(value, dict):
-            return {str(key): CrocoddylMPCNode._json_safe(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [CrocoddylMPCNode._json_safe(item) for item in value]
-        return value
-
-    def _pose_record(self, pose) -> dict[str, list[float]]:
-        quaternion = self.pin.Quaternion(pose.rotation).coeffs()
-        return {
-            "position": [float(value) for value in pose.translation],
-            "orientation_xyzw": [float(value) for value in quaternion],
-        }
-
-    def _joint_limit_record(self, q: np.ndarray) -> dict[str, list[float]]:
-        lower = np.asarray(self.model.lowerPositionLimit, dtype=float)
-        upper = np.asarray(self.model.upperPositionLimit, dtype=float)
-        soft_lower = lower + self.joint_limit_margin
-        soft_upper = upper - self.joint_limit_margin
-        q = np.asarray(q, dtype=float)
-        return {
-            "lower": lower,
-            "upper": upper,
-            "hard_margin": np.minimum(q - lower, upper - q),
-            "soft_margin": np.minimum(q - soft_lower, soft_upper - q),
-            "soft_violation": np.maximum(soft_lower - q, 0.0)
-            + np.maximum(q - soft_upper, 0.0),
-        }
-
-    def _jacobian_record(self, q: np.ndarray, pose) -> dict[str, object]:
-        self.pin.computeJointJacobians(self.model, self.pose_data, q)
-        self.pin.updateFramePlacements(self.model, self.pose_data)
-        jacobian = np.asarray(
-            self.pin.getFrameJacobian(
-                self.model, self.pose_data, self.frame_id, self.pin.LOCAL
-            ),
-            dtype=float,
-        ).copy()
-        singular_values = np.linalg.svd(jacobian, compute_uv=False)
-        sigma_min = float(singular_values[-1])
-        condition = (
-            float(singular_values[0] / sigma_min)
-            if sigma_min > 1.0e-12
-            else float("inf")
-        )
-        world_z_local = np.asarray(pose.rotation.T @ np.array([0.0, 0.0, 1.0]))
-        world_z_twist = np.r_[np.zeros(3), world_z_local]
-        world_z_qdot = np.linalg.pinv(jacobian) @ world_z_twist
-        return {
-            "local": jacobian,
-            "singular_values": singular_values,
-            "sigma_min": sigma_min,
-            "condition_number": condition,
-            "world_z_axis_in_tcp": world_z_local,
-            "unit_world_z_yaw_qdot": world_z_qdot,
-            "unit_world_z_yaw_qdot_norm": float(np.linalg.norm(world_z_qdot)),
-        }
-
-    def _write_diagnostic(
-        self,
-        *,
-        status: str,
-        state: np.ndarray,
-        target,
-        solve_time_ms: float = float("nan"),
-        solver_success: bool = False,
-        solver_iterations: int = 0,
-        solver_cost: float = float("nan"),
-        solver_error: str = "",
-        stationary_optimum: bool = False,
-        prediction_guard: str = "",
-        raw_control: np.ndarray | None = None,
-        q_cmd: np.ndarray | None = None,
-        predicted_next_state: np.ndarray | None = None,
-        applied_state: np.ndarray | None = None,
-        cost_terms: dict | None = None,
-        terminal_cost_terms: dict | None = None,
-        current_pose=None,
-        pose_error: np.ndarray | None = None,
-        jacobian: dict | None = None,
-        dynamics: dict | None = None,
-    ) -> None:
-        if self._diagnostic_file is None:
-            return
-        try:
-            state = np.asarray(state, dtype=float)
-            q = state[: self.model.nq]
-            velocity = state[self.model.nq : self.model.nq + self.model.nv]
-            if current_pose is None:
-                current_pose = self._tcp_pose(q).copy()
-            if pose_error is None:
-                pose_error = self._pose_error(q, target, self.pose_data)
-            if jacobian is None:
-                jacobian = self._jacobian_record(q, current_pose)
-            if raw_control is None:
-                raw_control = np.full(self.model.nv, np.nan)
-            if q_cmd is None:
-                q_cmd = np.full(self.model.nq, np.nan)
-            if cost_terms is None:
-                cost_terms = {}
-            if terminal_cost_terms is None:
-                terminal_cost_terms = {}
-            if dynamics is None:
-                dynamics = {}
-            qref = np.asarray(self.xref[: self.model.nq], dtype=float)
-            angular_distance = float(
-                np.linalg.norm(
-                    self.pin.log3(
-                        self.cartesian_path_start_pose.rotation.T
-                        @ self.target_pose.rotation
-                    )
-                )
-            )
-            record = {
-                "schema_version": 3,
-                "elapsed_s": time.monotonic() - self._diagnostic_start_monotonic,
-                "ros_time_s": self.get_clock().now().nanoseconds * 1.0e-9,
-                "cycle": self.solve_count,
-                "status": status,
-                "state": {
-                    "q": q,
-                    "velocity": velocity,
-                    "tcp_pose": self._pose_record(current_pose),
-                },
-                "state_input": {
-                    "age_s": time.monotonic() - self.last_state_update_monotonic
-                    if np.isfinite(self.last_state_update_monotonic)
-                    else float("nan"),
-                    "message_stamp_s": self.last_state_stamp_s,
-                    "message_age_s": self.get_clock().now().nanoseconds * 1.0e-9
-                    - self.last_state_stamp_s
-                    if np.isfinite(self.last_state_stamp_s)
-                    else float("nan"),
-                },
-                "target_pose": self._pose_record(target),
-                "target_input": {
-                    "update_count": self.target_update_count,
-                    "age_s": time.monotonic() - self.last_target_update_monotonic
-                    if np.isfinite(self.last_target_update_monotonic)
-                    else float("nan"),
-                    "message_stamp_s": self.last_target_stamp_s,
-                    "update_dt_s": self.last_target_update_dt,
-                    "delta_rotation_world_rad": self.last_target_delta_rotation_world,
-                    "angular_velocity_world_rad_s": self.last_target_angular_velocity_world,
-                },
-                "cartesian_path": {
-                    "start_pose": self._pose_record(self.cartesian_path_start_pose),
-                    "goal_pose": self._pose_record(self.target_pose),
-                    "reference_pose": self._pose_record(self.cartesian_reference_poses[0]),
-                    "reference_horizon": [
-                        self._pose_record(reference)
-                        for reference in self.cartesian_reference_poses
-                    ],
-                    "speed_limit_m_s": self.cartesian_path_speed,
-                    "angular_speed_limit_rad_s": self.cartesian_max_angular_speed,
-                    "angular_distance_rad": angular_distance,
-                    "duration_s": self.cartesian_path_duration,
-                    "progress": self.cartesian_path_progress,
-                    "deviation_m": self.cartesian_path_deviation,
-                    "tolerance_m": self.cartesian_path_tolerance,
-                    "command_scale": self.cartesian_command_scale,
-                    "guard": self.cartesian_path_guard,
-                },
-                "pose_error_local": pose_error,
-                "position_error_world": np.asarray(target.translation - current_pose.translation),
-                "orientation_error_world": np.asarray(current_pose.rotation @ pose_error[3:]),
-                "position_error_norm_m": float(np.linalg.norm(pose_error[:3])),
-                "orientation_error_norm_rad": float(np.linalg.norm(pose_error[3:])),
-                "qref": qref,
-                "q_cmd": q_cmd,
-                "q_minus_qref": q - qref,
-                "joint_limits": self._joint_limit_record(q),
-                "solver": {
-                    "success": bool(solver_success),
-                    "iterations": int(solver_iterations),
-                    "solve_time_ms": float(solve_time_ms),
-                    "cost": float(solver_cost),
-                    "error": solver_error,
-                    "stop": getattr(self.solver, "stop", ""),
-                    "th_stop": getattr(self.solver, "th_stop", float("nan")),
-                    "th_grad": getattr(self.solver, "th_grad", float("nan")),
-                    "dV": getattr(self.solver, "dV", []),
-                    "state_regularization": getattr(self.solver, "preg", float("nan")),
-                    "regularization_delta": getattr(self.solver, "dreg", float("nan")),
-                    "stationary_optimum": bool(stationary_optimum),
-                    "prediction_guard": prediction_guard,
-                },
-                "control": {
-                    "raw_torque": raw_control,
-                    # Legacy name retained so old analysis scripts still load.
-                    "raw_qddot": raw_control,
-                    "raw_norm": float(np.linalg.norm(raw_control))
-                    if np.all(np.isfinite(raw_control))
-                    else float("nan"),
-                    "command_boundary": "joint_position",
-                    "applied_torque": None,
-                    "target_qddot_after_clip": self.last_target_acceleration,
-                    "applied_qddot": self.last_applied_acceleration,
-                    "applied_norm": float(np.linalg.norm(self.last_applied_acceleration)),
-                },
-                "cost_terms": cost_terms,
-                "terminal_cost_terms": terminal_cost_terms,
-                "dynamics": dynamics,
-                "jacobian": jacobian,
-                "predicted_next_state": predicted_next_state,
-                "applied_state": applied_state,
-            }
-            if self.diagnostic_log_prediction:
-                record["prediction"] = {
-                    "xs": [np.asarray(item, dtype=float) for item in self.xs],
-                    "us": [np.asarray(item, dtype=float) for item in self.us],
-                }
-            self._diagnostic_file.write(
-                json.dumps(self._json_safe(record), separators=(",", ":")) + "\n"
-            )
-            if time.monotonic() - self._diagnostic_last_flush >= self.diagnostic_flush_period:
-                self._diagnostic_file.flush()
-                self._diagnostic_last_flush = time.monotonic()
-        except (OSError, TypeError, ValueError, RuntimeError) as exc:
-            self.get_logger().error(f"진단 로그 기록 실패: {exc}")
-            self._diagnostic_file.close()
-            self._diagnostic_file = None
 
     @staticmethod
     def _parse_quaternion(value: object) -> np.ndarray:
@@ -949,7 +626,9 @@ class CrocoddylMPCNode(Node):
         terminal_model = c.IntegratedActionModelEuler(self.terminal_action, 0.0)
         x0 = self.xref.copy()
         problem = c.ShootingProblem(x0, running_models, terminal_model)
-        return problem, c.SolverFDDP(problem)
+        # FDDP ignores control bounds. The action model's effort limits are
+        # enforced only by the box-constrained solver.
+        return problem, c.SolverBoxFDDP(problem)
 
     def _reload_cost_config_if_changed(self) -> None:
         """Apply edited cost settings without restarting the active MPC solver."""
@@ -1178,7 +857,11 @@ class CrocoddylMPCNode(Node):
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
         seed = self.latest_state[:6] if self.latest_state is not None else self.sim_q
-        self.xref = np.r_[self._solve_ik(self._optimization_target_pose(), seed), np.zeros(self.model.nv)]
+        qref = (
+            self._solve_ik(self._optimization_target_pose(), seed)
+            if self.diagnostic_ik_enabled else seed.copy()
+        )
+        self.xref = np.r_[qref, np.zeros(self.model.nv)]
 
     def _optimization_target_pose(self, desired=None):
         """Project an infeasible desired goal for MPC while preserving its input pose."""
@@ -1431,20 +1114,21 @@ class CrocoddylMPCNode(Node):
         self._publish_pose(self.current_pose_pub, current_pose)
         self._publish_qref()
         self.solve_count += 1
-        self._write_diagnostic(
-            status=self._command_guard() or "stationary_hold",
-            state=state,
-            target=self.target_pose,
-            solver_success=True,
-            solver_cost=self.stationary_hold_cost,
-            q_cmd=q_cmd,
-            current_pose=current_pose,
-            pose_error=pose_error,
-            stationary_optimum=True,
-            cost_terms={},
-            terminal_cost_terms={},
-            dynamics={},
-        )
+        if self._diagnostics_due():
+            self._write_diagnostic(
+                status=self._command_guard() or "stationary_hold",
+                state=state,
+                target=self.target_pose,
+                solver_success=True,
+                solver_cost=self.stationary_hold_cost,
+                q_cmd=q_cmd,
+                current_pose=current_pose,
+                pose_error=pose_error,
+                stationary_optimum=True,
+                cost_terms=self.last_cost_terms,
+                terminal_cost_terms=self.last_terminal_cost_terms,
+                dynamics=self.last_dynamics,
+            )
         self._publish_command_pose(q_cmd)
 
     def _set_execution_enabled(self, enabled):
@@ -1484,6 +1168,24 @@ class CrocoddylMPCNode(Node):
             self._publish_sim_state()
 
     def _solve_once(self) -> None:
+        callback_start = time.perf_counter()
+        try:
+            self._solve_once_impl()
+        finally:
+            publisher = getattr(self, "callback_time_pub", None)
+            if publisher is not None:
+                publisher.publish(
+                    Float64(data=1.0e3 * (time.perf_counter() - callback_start))
+                )
+
+    def _diagnostics_due(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_diagnostic_time < self.diagnostic_period:
+            return False
+        self._last_diagnostic_time = now
+        return True
+
+    def _solve_once_impl(self) -> None:
         if self.internal_simulation:
             self.latest_state = np.r_[self.sim_q, self.sim_v]
             self.last_state_update_monotonic = time.monotonic()
@@ -1492,6 +1194,20 @@ class CrocoddylMPCNode(Node):
             if not self.warned_no_state:
                 self.get_logger().warn("joint_states를 기다리는 중입니다.")
                 self.warned_no_state = True
+            return
+
+        state_age = time.monotonic() - self.last_state_update_monotonic
+        if not np.isfinite(state_age) or state_age > self.joint_state_timeout:
+            self._paused_alignment_target = None
+            if self.execution_enabled:
+                self.solve_success_pub.publish(Float64(data=0.0))
+                self.status_pub.publish(String(data="joint_state_stale"))
+                self.get_logger().error(
+                    "Joint state is stale; MPC output is suspended until fresh feedback returns.",
+                    throttle_duration_sec=2.0,
+                )
+            else:
+                self.status_pub.publish(String(data="paused_joint_state_stale"))
             return
 
         if self.vive_control is not None:
@@ -1554,6 +1270,7 @@ class CrocoddylMPCNode(Node):
         self.xs[0] = state.copy()
         self.last_target_acceleration.fill(np.nan)
         self.last_applied_acceleration.fill(np.nan)
+        diagnostics_due = self._diagnostics_due()
         solve_start = time.perf_counter()
         try:
             solved = bool(self.solver.solve(self.xs, self.us, self.max_solver_iterations, False))
@@ -1562,14 +1279,15 @@ class CrocoddylMPCNode(Node):
             self.get_logger().error(f"MPC solve 실패: {exc}")
             self.solve_success_pub.publish(Float64(data=0.0))
             self.status_pub.publish(String(data="exception"))
-            self._write_diagnostic(
-                status="exception",
-                state=state,
-                target=self.target_pose,
-                solve_time_ms=solve_time_ms,
-                solver_iterations=int(getattr(self.solver, "iter", 0)),
-                solver_error=repr(exc),
-            )
+            if diagnostics_due:
+                self._write_diagnostic(
+                    status="exception",
+                    state=state,
+                    target=self.target_pose,
+                    solve_time_ms=solve_time_ms,
+                    solver_iterations=int(getattr(self.solver, "iter", 0)),
+                    solver_error=repr(exc),
+                )
             return
         solve_time_ms = 1.0e3 * (time.perf_counter() - solve_start)
         solver_iterations = int(getattr(self.solver, "iter", 0))
@@ -1590,14 +1308,15 @@ class CrocoddylMPCNode(Node):
         ):
             self.solve_success_pub.publish(Float64(data=0.0))
             self.status_pub.publish(String(data="invalid_solution"))
-            self._write_diagnostic(
-                status="invalid_solution",
-                state=state,
-                solver_iterations=solver_iterations,
-                solver_cost=solver_cost,
-                target=self.target_pose,
-                solve_time_ms=solve_time_ms,
-            )
+            if diagnostics_due:
+                self._write_diagnostic(
+                    status="invalid_solution",
+                    state=state,
+                    solver_iterations=solver_iterations,
+                    solver_cost=solver_cost,
+                    target=self.target_pose,
+                    solve_time_ms=solve_time_ms,
+                )
             return
         self.xs, self.us = self.solver.xs, self.solver.us
         cost = solver_cost
@@ -1607,19 +1326,28 @@ class CrocoddylMPCNode(Node):
         optimization_error = self._pose_error(
             state[:6], self._optimization_target_pose(), self.pose_data
         )
-        jacobian = self._jacobian_record(state[:6], current_pose)
-        cost_terms = self.running_action.cost_terms(state, raw_control)
-        terminal_cost_terms = self.terminal_action.cost_terms(
-            self.xs[-1], np.zeros(self.model.nv)
-        )
-        dynamics = self.running_action.dynamics_terms(state, raw_control)
-        self.last_dynamics = dynamics
+        if diagnostics_due:
+            jacobian = self._jacobian_record(state[:6], current_pose)
+            cost_terms = self.running_action.cost_terms(state, raw_control)
+            terminal_cost_terms = self.terminal_action.cost_terms(
+                self.xs[-1], np.zeros(self.model.nv)
+            )
+            dynamics = self.running_action.dynamics_terms(state, raw_control)
+            self.last_cost_terms = dict(cost_terms)
+            self.last_terminal_cost_terms = dict(terminal_cost_terms)
+            self.last_dynamics = dynamics
+        else:
+            jacobian = {}
+            cost_terms = dict(self.last_cost_terms)
+            terminal_cost_terms = dict(self.last_terminal_cost_terms)
+            dynamics = self.last_dynamics
         self.cost_pub.publish(Float64(data=cost))
-        for name, publisher in self.cost_term_pubs.items():
-            publisher.publish(Float64(data=float(cost_terms.get(name, 0.0))))
-        self.terminal_cost_pub.publish(
-            Float64(data=float(sum(terminal_cost_terms.values())))
-        )
+        if diagnostics_due:
+            for name, publisher in self.cost_term_pubs.items():
+                publisher.publish(Float64(data=float(cost_terms.get(name, 0.0))))
+            self.terminal_cost_pub.publish(
+                Float64(data=float(sum(terminal_cost_terms.values())))
+            )
         self.task_error_pub.publish(Float64(data=float(np.linalg.norm(task_error))))
         self.position_error_pub.publish(Float64(data=float(np.linalg.norm(task_error[:3]))))
         self.orientation_error_pub.publish(Float64(data=float(np.linalg.norm(task_error[3:]))))
@@ -1686,27 +1414,28 @@ class CrocoddylMPCNode(Node):
             self._step_simulation(q_cmd)
             self._publish_sim_state()
             applied_state = np.r_[self.sim_q, self.sim_v].copy()
-        self._write_diagnostic(
-            status=status,
-            state=state,
-            target=self.target_pose,
-            solve_time_ms=solve_time_ms,
-            solver_success=solver_success,
-            solver_iterations=solver_iterations,
-            solver_cost=cost,
-            stationary_optimum=stationary_optimum,
-            prediction_guard=prediction_guard,
-            raw_control=raw_control,
-            q_cmd=q_cmd,
-            predicted_next_state=self.xs[1],
-            applied_state=applied_state,
-            cost_terms=cost_terms,
-            terminal_cost_terms=terminal_cost_terms,
-            current_pose=current_pose,
-            pose_error=task_error,
-            jacobian=jacobian,
-            dynamics=dynamics,
-        )
+        if diagnostics_due:
+            self._write_diagnostic(
+                status=status,
+                state=state,
+                target=self.target_pose,
+                solve_time_ms=solve_time_ms,
+                solver_success=solver_success,
+                solver_iterations=solver_iterations,
+                solver_cost=cost,
+                stationary_optimum=stationary_optimum,
+                prediction_guard=prediction_guard,
+                raw_control=raw_control,
+                q_cmd=q_cmd,
+                predicted_next_state=self.xs[1],
+                applied_state=applied_state,
+                cost_terms=cost_terms,
+                terminal_cost_terms=terminal_cost_terms,
+                current_pose=current_pose,
+                pose_error=task_error,
+                jacobian=jacobian,
+                dynamics=dynamics,
+            )
         self._publish_command_pose(q_cmd)
 
     def _safe_joint_command(self, predicted_q: np.ndarray, state: np.ndarray) -> np.ndarray:
@@ -1808,8 +1537,8 @@ class CrocoddylMPCNode(Node):
         self.sim_acceleration = (self.sim_v - previous_velocity) / self.dt
         self.last_target_acceleration = np.clip(
             self.sim_acceleration,
-            -self.acceleration_limits,
-            self.acceleration_limits,
+            -self.diagnostic_acceleration_clip,
+            self.diagnostic_acceleration_clip,
         )
         self.last_applied_acceleration = self.sim_acceleration.copy()
 

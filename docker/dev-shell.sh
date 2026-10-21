@@ -38,11 +38,17 @@ if [[ -f /opt/robot_teleoperation_framework/install/setup.bash ]]; then
 fi
 
 if [[ ! -f "$build_root/install/setup.bash" || "${FORCE_COLCON_BUILD:-0}" == 1 ]]; then
-    python3 -m colcon --log-base "$build_root/log" build \
-        --symlink-install --merge-install \
-        --base-paths "${base_paths[@]}" \
-        --build-base "$build_root/build" \
-        --install-base "$build_root/install"
+    exec 8>"$build_root/colcon-build.lock"
+    flock 8
+    if [[ ! -f "$build_root/install/setup.bash" || "${FORCE_COLCON_BUILD:-0}" == 1 ]]; then
+        python3 -m colcon --log-base "$build_root/log" build \
+            --symlink-install --merge-install \
+            --base-paths "${base_paths[@]}" \
+            --build-base "$build_root/build" \
+            --install-base "$build_root/install"
+    fi
+    flock -u 8
+    exec 8>&-
 fi
 
 source "$build_root/install/setup.bash"

@@ -27,6 +27,7 @@ crocoddyl_mpc:
     # MPC discretization and solver budget.
     horizon: 20
     dt: 0.005  # 200 Hz, matching ros2_control and DCP3 feedback/commands.
+    joint_state_timeout: 0.5
     max_solver_iterations: 7
 
     # MPC cost weights: SE(3) tracking + posture + velocity + torque
@@ -36,21 +37,22 @@ crocoddyl_mpc:
     posture_cost_weight: 0.05
     velocity_cost_weight: 0.25
     torque_cost_weight: 0.0001
-    # Legacy key accepted by the node but unused by the dynamic predictor.
-    acceleration_cost_weight: 0.05
     joint_limit_cost_weight: 10.0
     running_cost_weight: 1.0
     terminal_cost_weight: 10.0
     nominal_posture: [0.0, 0.0, -1.57, 0.0, -1.57, 0.0]
     joint_limit_margin: 0.1
+    # Enforced on internal predicted torques by SolverBoxFDDP. Real DCP3
+    # commands remain joint positions and use the controller's own profiles.
     torque_limits: [431.97, 431.97, 197.23, 79.79, 79.79, 79.79]
-    acceleration_limits: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+    # Diagnostic-only clipping for the internal position-servo test plant.
+    diagnostic_acceleration_clip: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
 
-    # DLS IK is retained only to publish qref and provide a pose-to-joint
-    # diagnostic. The actual MPC includes the SE(3) residual directly.
+    # Optional DLS IK diagnostic; disabled by default to keep target updates fast.
     ik_max_iterations: 150
     ik_damping: 0.001
     ik_step: 0.3
+    diagnostic_ik_enabled: false
 
     # This is also read by the node when it is run directly.  The launch file
     # uses its simulate:= argument for the GUI/simulation process topology.
@@ -82,12 +84,9 @@ crocoddyl_mpc:
     cartesian_path_tolerance: 0.005
     cartesian_reference_topic: mpc/cartesian_reference_pose
 
-    # Preview-only simulation stabilizers; they are not hardware parameters.
-    simulation_damping: 5.0
-    simulation_acceleration_smoothing: 0.25
-
-    # One JSONL record per MPC cycle for post-run diagnosis.
+    # Full diagnostic calculations and JSONL records run at this rate.
     diagnostic_logging: true
+    diagnostic_rate: 10.0
     # Empty means ros2_ws/logs/indy7_mpc/<UTC run>/.
     diagnostic_log_directory: ""
     diagnostic_flush_period: 1.0
