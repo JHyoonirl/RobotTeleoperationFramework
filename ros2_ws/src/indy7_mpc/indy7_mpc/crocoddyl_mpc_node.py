@@ -86,6 +86,15 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.declare_parameter("cartesian_speed_margin", 0.5)
         self.declare_parameter("cartesian_min_duration", 0.10)
         self.declare_parameter("cartesian_path_tolerance", 0.005)
+        # Feed desired TCP motion into the joint-velocity part of the MPC cost.
+        # The reference is filtered, Jacobian-mapped and speed-limited.
+        self.declare_parameter("pose_velocity_feedforward_enabled", False)
+        self.declare_parameter("pose_velocity_feedforward_gain", 0.5)
+        self.declare_parameter("pose_velocity_feedforward_filter_time_constant", 0.08)
+        self.declare_parameter("pose_velocity_feedforward_stale_decay", 0.15)
+        self.declare_parameter("pose_velocity_feedforward_max_sample_interval", 0.25)
+        self.declare_parameter("pose_velocity_feedforward_damping", 0.05)
+        self.declare_parameter("pose_velocity_feedforward_max_joint_speed", 0.5)
         self.declare_parameter(
             "cartesian_reference_topic", "mpc/cartesian_reference_pose"
         )
@@ -215,6 +224,27 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.cartesian_path_tolerance = float(
             self.get_parameter("cartesian_path_tolerance").value
         )
+        self.pose_velocity_feedforward_enabled = self._as_bool(
+            self.get_parameter("pose_velocity_feedforward_enabled").value
+        )
+        self.pose_velocity_feedforward_gain = float(
+            self.get_parameter("pose_velocity_feedforward_gain").value
+        )
+        self.pose_velocity_feedforward_filter_time_constant = float(
+            self.get_parameter("pose_velocity_feedforward_filter_time_constant").value
+        )
+        self.pose_velocity_feedforward_stale_decay = float(
+            self.get_parameter("pose_velocity_feedforward_stale_decay").value
+        )
+        self.pose_velocity_feedforward_max_sample_interval = float(
+            self.get_parameter("pose_velocity_feedforward_max_sample_interval").value
+        )
+        self.pose_velocity_feedforward_damping = float(
+            self.get_parameter("pose_velocity_feedforward_damping").value
+        )
+        self.pose_velocity_feedforward_max_joint_speed = float(
+            self.get_parameter("pose_velocity_feedforward_max_joint_speed").value
+        )
         self.cartesian_reference_topic = str(
             self.get_parameter("cartesian_reference_topic").value
         ).strip()
@@ -325,6 +355,22 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             raise ValueError("cost weight는 모두 양수인 유한값이어야 합니다.")
         if not np.isfinite(self.cartesian_path_tolerance) or self.cartesian_path_tolerance <= 0.0:
             raise ValueError("cartesian_path_tolerance은 양수인 유한값이어야 합니다 [m].")
+        feedforward_settings = (
+            self.pose_velocity_feedforward_gain,
+            self.pose_velocity_feedforward_filter_time_constant,
+            self.pose_velocity_feedforward_stale_decay,
+            self.pose_velocity_feedforward_max_sample_interval,
+            self.pose_velocity_feedforward_damping,
+            self.pose_velocity_feedforward_max_joint_speed,
+        )
+        if (
+            not np.all(np.isfinite(feedforward_settings))
+            or not 0.0 <= self.pose_velocity_feedforward_gain <= 1.0
+            or any(value <= 0.0 for value in feedforward_settings[1:])
+        ):
+            raise ValueError(
+                "Pose velocity feedforward gain은 [0, 1], 나머지 설정은 양수인 유한값이어야 합니다."
+            )
         # The continuous command-step bound assumes bounded revolute joints.
         if (self.control_mode == "task_space" or self.workspace_floor_enabled) and any(
             not joint.shortname().startswith("JointModelR") or joint.nq != 1 or joint.nv != 1
@@ -466,7 +512,13 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.previous_target_pose = self.target_pose.copy()
         self.last_target_update_dt = float("nan")
         self.last_target_delta_rotation_world = np.zeros(3)
+        self.last_target_linear_velocity_world = np.zeros(3)
         self.last_target_angular_velocity_world = np.zeros(3)
+        self.filtered_target_linear_velocity_world = np.zeros(3)
+        self.filtered_target_angular_velocity_world = np.zeros(3)
+        self._feedforward_previous_target_pose = self.target_pose.copy()
+        self._feedforward_previous_update_monotonic = time.monotonic()
+        self.last_pose_velocity_feedforward = np.zeros(self.model.nv)
         if self.vive_follow_enabled:
             self.vive_control = ViveSimulationControl(self)
         self._diagnostic_start_monotonic = time.monotonic()
@@ -766,6 +818,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
                 )[0])
             )
 
+        velocity_reference = self._joint_velocity_feedforward(q)
         for action, reference_pose in zip(
             self.running_actions, self.cartesian_reference_poses[:-1]
         ):
@@ -774,11 +827,142 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
                 self.cartesian_path_start_pose.translation,
                 self._optimization_target_pose().translation,
             )
+            action.update_velocity_reference(velocity_reference)
         self.terminal_action.update_target(self.cartesian_reference_poses[-1])
         self.terminal_action.update_path(
             self.cartesian_path_start_pose.translation,
             self._optimization_target_pose().translation,
         )
+        self.terminal_action.update_velocity_reference(velocity_reference)
+
+    def _reset_pose_velocity_estimate(self, target_pose, now=None) -> None:
+        """Prevent a synchronization or mode transition from becoming motion feedforward."""
+        now = time.monotonic() if now is None else float(now)
+        self._feedforward_previous_target_pose = target_pose.copy()
+        self._feedforward_previous_update_monotonic = now
+        self.filtered_target_linear_velocity_world = np.zeros(3)
+        self.filtered_target_angular_velocity_world = np.zeros(3)
+        self.last_target_linear_velocity_world = np.zeros(3)
+        self.last_target_angular_velocity_world = np.zeros(3)
+        self.last_target_delta_rotation_world = np.zeros(3)
+        self.last_target_update_dt = float("nan")
+        self.last_pose_velocity_feedforward = np.zeros(self.model.nv)
+
+    @staticmethod
+    def _limit_vector_norm(vector: np.ndarray, maximum: float) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm):
+            return np.zeros_like(vector)
+        return vector * (maximum / norm) if norm > maximum else vector
+
+    def _update_pose_velocity_estimate(self, target_pose, now: float) -> None:
+        """Estimate and filter world-frame linear/angular target velocity."""
+        previous = self._feedforward_previous_target_pose
+        previous_time = self._feedforward_previous_update_monotonic
+        sample_dt = float(now - previous_time)
+        linear_velocity = np.zeros(3)
+        angular_velocity = np.zeros(3)
+        delta_rotation_world = np.zeros(3)
+        valid_sample = (
+            np.isfinite(sample_dt)
+            and 1.0e-4 < sample_dt <= self.pose_velocity_feedforward_max_sample_interval
+        )
+        if valid_sample:
+            linear_velocity = (
+                target_pose.translation - previous.translation
+            ) / sample_dt
+            delta_rotation_local = self.pin.log3(
+                previous.rotation.T @ target_pose.rotation
+            )
+            delta_rotation_world = previous.rotation @ delta_rotation_local
+            angular_velocity = delta_rotation_world / sample_dt
+            linear_velocity = self._limit_vector_norm(
+                linear_velocity, self.cartesian_max_speed
+            )
+            angular_velocity = self._limit_vector_norm(
+                angular_velocity, self.cartesian_max_angular_speed
+            )
+            # Ignore tracker noise below a small speed deadband.
+            if np.linalg.norm(linear_velocity) < 0.001:
+                linear_velocity.fill(0.0)
+            if np.linalg.norm(angular_velocity) < 0.005:
+                angular_velocity.fill(0.0)
+            alpha = 1.0 - np.exp(
+                -sample_dt / self.pose_velocity_feedforward_filter_time_constant
+            )
+            self.filtered_target_linear_velocity_world = (
+                (1.0 - alpha) * self.filtered_target_linear_velocity_world
+                + alpha * linear_velocity
+            )
+            self.filtered_target_angular_velocity_world = (
+                (1.0 - alpha) * self.filtered_target_angular_velocity_world
+                + alpha * angular_velocity
+            )
+        else:
+            # A long gap makes a finite difference misleading; restart from rest.
+            self.filtered_target_linear_velocity_world.fill(0.0)
+            self.filtered_target_angular_velocity_world.fill(0.0)
+
+        self.last_target_update_dt = sample_dt
+        self.last_target_delta_rotation_world = delta_rotation_world
+        self.last_target_linear_velocity_world = linear_velocity
+        self.last_target_angular_velocity_world = angular_velocity
+        self._feedforward_previous_target_pose = target_pose.copy()
+        self._feedforward_previous_update_monotonic = now
+
+    def _joint_velocity_feedforward(self, q: np.ndarray) -> np.ndarray:
+        """Map filtered TCP twist to a bounded joint-velocity cost reference."""
+        result = np.zeros(self.model.nv)
+        if (
+            self.control_mode != "task_space"
+            or not self.pose_velocity_feedforward_enabled
+            or self.pose_velocity_feedforward_gain <= 0.0
+        ):
+            self.last_pose_velocity_feedforward = result
+            return result
+
+        age = time.monotonic() - self._feedforward_previous_update_monotonic
+        if not np.isfinite(age) or age < 0.0:
+            self.last_pose_velocity_feedforward = result
+            return result
+        stale_scale = np.exp(-age / self.pose_velocity_feedforward_stale_decay)
+        twist = self.pose_velocity_feedforward_gain * stale_scale * np.r_[
+            self.filtered_target_linear_velocity_world,
+            self.filtered_target_angular_velocity_world,
+        ]
+        if not np.all(np.isfinite(twist)) or np.linalg.norm(twist) < 1.0e-10:
+            self.last_pose_velocity_feedforward = result
+            return result
+
+        try:
+            self.pin.computeJointJacobians(self.model, self.pose_data, q)
+            self.pin.updateFramePlacements(self.model, self.pose_data)
+            jacobian = self.pin.getFrameJacobian(
+                self.model, self.pose_data, self.frame_id, self.pin.LOCAL_WORLD_ALIGNED
+            )
+            damping_squared = self.pose_velocity_feedforward_damping**2
+            result = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + damping_squared * np.eye(6), twist
+            )
+        except (ValueError, np.linalg.LinAlgError, RuntimeError):
+            result = np.zeros(self.model.nv)
+        if not np.all(np.isfinite(result)):
+            result = np.zeros(self.model.nv)
+        per_joint_limits = np.minimum(
+            self.command_velocity_limits, np.asarray(self.model.velocityLimit, dtype=float)
+        )
+        maximum_ratio = float(np.max(np.abs(result) / np.maximum(per_joint_limits, 1.0e-12)))
+        maximum_component = float(np.max(np.abs(result))) if result.size else 0.0
+        scale = min(
+            1.0,
+            1.0 / maximum_ratio if maximum_ratio > 1.0 else 1.0,
+            self.pose_velocity_feedforward_max_joint_speed / maximum_component
+            if maximum_component > self.pose_velocity_feedforward_max_joint_speed else 1.0,
+        )
+        result *= scale
+        self.last_pose_velocity_feedforward = result.copy()
+        return result
 
     def _on_target_pose(self, message: PoseStamped) -> None:
         if self.vive_control is not None and self.vive_control.following:
@@ -835,18 +1019,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             ):
                 self.cartesian_path_start_pose = current_pose
                 self.cartesian_path_start_time = update_now
-        target_dt = update_now - self.last_target_update_monotonic
-        if self.previous_target_pose is not None and target_dt > 0.0:
-            delta_local = self.pin.log3(
-                self.previous_target_pose.rotation.T @ new_target.rotation
-            )
-            self.last_target_delta_rotation_world = (
-                self.previous_target_pose.rotation @ delta_local
-            )
-            self.last_target_update_dt = target_dt
-            self.last_target_angular_velocity_world = (
-                self.last_target_delta_rotation_world / target_dt
-            )
+        self._update_pose_velocity_estimate(new_target, update_now)
         self.target_pose = new_target
         self.previous_target_pose = new_target.copy()
         self.target_update_count += 1
@@ -953,6 +1126,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             current_pose = self._tcp_pose(position).copy()
             self.target_pose = current_pose
             self.previous_target_pose = current_pose.copy()
+            self._reset_pose_velocity_estimate(current_pose)
             self.cartesian_path_start_pose = current_pose.copy()
             self.cartesian_path_start_time = time.monotonic()
             self.cartesian_path_duration = self.cartesian_min_duration
@@ -1026,6 +1200,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         ]
         self.target_pose = target_pose
         self.previous_target_pose = target_pose.copy()
+        self._reset_pose_velocity_estimate(target_pose, now)
         self.xref = np.r_[target_q, np.zeros(self.model.nv)]
         state_reference = np.r_[target_q, np.zeros(self.model.nv)]
         self.xs = [state_reference.copy() for _ in range(self.horizon + 1)]
@@ -1140,6 +1315,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         current = self._tcp_pose(q).copy()
         self.target_pose = current
         self.previous_target_pose = current.copy()
+        self._reset_pose_velocity_estimate(current)
         self.cartesian_path_start_pose = current.copy()
         self.cartesian_path_start_time = time.monotonic()
         self.cartesian_path_duration = self.cartesian_min_duration

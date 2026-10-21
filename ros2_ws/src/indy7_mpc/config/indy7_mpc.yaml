@@ -32,10 +32,13 @@ crocoddyl_mpc:
 
     # MPC cost weights: SE(3) tracking + posture + velocity + torque
     # + soft joint-limit avoidance.
-    se3_position_cost_weight: 10000.0
-    se3_orientation_cost_weight: 1000.0
+    # Favor task-space accuracy moderately more than the previous profile.
+    # The command rate/increment limits below remain the hard per-cycle bounds.
+    se3_position_cost_weight: 15000.0
+    se3_orientation_cost_weight: 1500.0
     posture_cost_weight: 0.05
-    velocity_cost_weight: 0.25
+    # Lower velocity damping to reduce lag while keeping torque cost/limits intact.
+    velocity_cost_weight: 0.10
     torque_cost_weight: 0.0001
     joint_limit_cost_weight: 10.0
     running_cost_weight: 1.0
@@ -83,6 +86,18 @@ crocoddyl_mpc:
     # Applied after joint clipping, including the joint-linear step between commands.
     cartesian_path_tolerance: 0.005
     cartesian_reference_topic: mpc/cartesian_reference_pose
+
+    # Optional experiment: target-pose velocity as a bounded joint-velocity
+    # reference. Left off by default because the current bounded Cartesian
+    # reference already handles motion and qdot feedforward raised torque in
+    # offline moving-target comparisons.
+    pose_velocity_feedforward_enabled: false
+    pose_velocity_feedforward_gain: 0.5
+    pose_velocity_feedforward_filter_time_constant: 0.08
+    pose_velocity_feedforward_stale_decay: 0.15
+    pose_velocity_feedforward_max_sample_interval: 0.25
+    pose_velocity_feedforward_damping: 0.05
+    pose_velocity_feedforward_max_joint_speed: 0.5
 
     # Full diagnostic calculations and JSONL records run at this rate.
     diagnostic_logging: true

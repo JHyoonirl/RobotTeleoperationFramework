@@ -100,12 +100,26 @@ def node():
     node.command_velocity_limits = np.ones(6)
     node.command_increment_limits = np.full(6, 0.02)
     node.cartesian_path_tolerance = 0.0025
+    node.cartesian_max_speed = 0.5
+    node.cartesian_max_angular_speed = 3.0
+    node.pose_velocity_feedforward_enabled = True
+    node.pose_velocity_feedforward_gain = 0.5
+    node.pose_velocity_feedforward_filter_time_constant = 0.08
+    node.pose_velocity_feedforward_stale_decay = 0.15
+    node.pose_velocity_feedforward_max_sample_interval = 0.25
+    node.pose_velocity_feedforward_damping = 0.05
+    node.pose_velocity_feedforward_max_joint_speed = 0.5
+    node.filtered_target_linear_velocity_world = np.zeros(3)
+    node.filtered_target_angular_velocity_world = np.zeros(3)
+    node.last_pose_velocity_feedforward = np.zeros(6)
     node.cartesian_reach_bound = sum(np.linalg.norm(p.translation) for p in model.jointPlacements)
     node.cartesian_reach_bound += np.linalg.norm(model.frames[node.frame_id].placement.translation)
     node.sim_q = np.array([0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
     node.cartesian_path_start_pose = node._tcp_pose(node.sim_q).copy()
     node.target_pose = node.cartesian_path_start_pose.copy()
     node.target_pose.translation += np.array([0.05, 0.0, 0.0])
+    node._feedforward_previous_target_pose = node.target_pose.copy()
+    node._feedforward_previous_update_monotonic = time.monotonic()
     return node
 
 
@@ -287,6 +301,66 @@ def test_path_cost_gradient_matches_finite_difference(node, terminal):
         assert gradient[index] == pytest.approx((plus - data.cost) / 2e-7, abs=1e-5)
     np.testing.assert_allclose(data.Lxx, data.Lxx.T, atol=1e-10)
     assert np.linalg.eigvalsh(data.Lxx).min() > 0
+
+
+def test_velocity_cost_tracks_nonzero_feedforward_reference(node):
+    weights = {name: 0.0 for name in (
+        "se3_position", "se3_orientation", "posture", "velocity", "torque", "joint_limit"
+    )}
+    weights["velocity"] = 2.0
+    action = SE3DynamicActionModel(
+        crocoddyl=crocoddyl, pin=pin, model=node.model, state=node.state,
+        frame_id=node.frame_id, target=node.target_pose, nominal_posture=node.sim_q,
+        weights=weights,
+    )
+    reference = np.array([0.1, -0.05, 0.02, 0.0, 0.03, -0.01])
+    velocity = np.array([0.2, -0.01, 0.02, 0.01, 0.01, 0.04])
+    action.update_velocity_reference(reference)
+    x, u = np.r_[node.sim_q, velocity], np.zeros(6)
+    data = action.createData()
+    action.calc(data, x, u)
+    action.calcDiff(data, x, u)
+    error = velocity - reference
+    assert data.cost == pytest.approx(0.5 * 2.0 * float(error @ error))
+    np.testing.assert_allclose(data.Lx[6:], 2.0 * error, atol=1.0e-9)
+    np.testing.assert_allclose(data.Lxx[6:, 6:], 2.000001 * np.eye(6), atol=1.0e-9)
+
+
+def test_target_twist_is_clamped_filtered_and_stale_samples_reset(node, monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr("indy7_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    previous = node._tcp_pose(node.sim_q).copy()
+    node._reset_pose_velocity_estimate(previous, clock[0])
+    target = previous.copy()
+    target.translation += np.array([0.1, 0.0, 0.0])
+    clock[0] += 0.1
+    node._update_pose_velocity_estimate(target, clock[0])
+    alpha = 1.0 - np.exp(-0.1 / node.pose_velocity_feedforward_filter_time_constant)
+    assert np.linalg.norm(node.last_target_linear_velocity_world) == pytest.approx(0.5)
+    assert node.filtered_target_linear_velocity_world[0] == pytest.approx(0.5 * alpha)
+    assert np.linalg.norm(node.filtered_target_angular_velocity_world) == pytest.approx(0.0)
+
+    clock[0] += node.pose_velocity_feedforward_max_sample_interval + 0.01
+    target.translation += np.array([0.1, 0.0, 0.0])
+    node._update_pose_velocity_estimate(target, clock[0])
+    np.testing.assert_array_equal(node.filtered_target_linear_velocity_world, np.zeros(3))
+    np.testing.assert_array_equal(node.filtered_target_angular_velocity_world, np.zeros(3))
+
+
+def test_joint_velocity_feedforward_is_finite_bounded_and_decays_when_stale(node, monkeypatch):
+    clock = [20.0]
+    monkeypatch.setattr("indy7_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    node._reset_pose_velocity_estimate(node._tcp_pose(node.sim_q), clock[0])
+    node.filtered_target_linear_velocity_world = np.array([0.2, 0.0, 0.0])
+    node._feedforward_previous_update_monotonic = clock[0]
+
+    velocity = node._joint_velocity_feedforward(node.sim_q)
+    assert np.all(np.isfinite(velocity))
+    assert 0.0 < np.max(np.abs(velocity)) <= node.pose_velocity_feedforward_max_joint_speed
+
+    clock[0] += 1.0
+    stale_velocity = node._joint_velocity_feedforward(node.sim_q)
+    assert np.max(np.abs(stale_velocity)) < 0.001
 
 
 def test_identical_target_does_not_reanchor_an_expired_path(node):

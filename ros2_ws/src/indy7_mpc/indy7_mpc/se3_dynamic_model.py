@@ -63,6 +63,7 @@ class SE3DynamicActionModel:
                 self.pin_data = model.createData()
                 self.nq = int(model.nq)
                 self.nv = int(model.nv)
+                self.velocity_reference = np.zeros(self.nv)
                 margin = float(joint_limit_margin)
                 self.soft_lower = model.lowerPositionLimit + margin
                 self.soft_upper = model.upperPositionLimit - margin
@@ -101,6 +102,12 @@ class SE3DynamicActionModel:
             def update_path(self, start, goal):
                 self.path_start = np.asarray(start, dtype=float).copy()
                 self.path_goal = np.asarray(goal, dtype=float).copy()
+
+            def update_velocity_reference(self, velocity):
+                velocity = np.asarray(velocity, dtype=float)
+                if velocity.shape != (self.nv,) or not np.all(np.isfinite(velocity)):
+                    raise ValueError("velocity reference must be finite and match nv")
+                self.velocity_reference = velocity.copy()
 
             def _path_error(self):
                 return segment_error(
@@ -154,6 +161,7 @@ class SE3DynamicActionModel:
                 pose_error = self._pose_error(q)
                 position_error = pose_error[:3]
                 orientation_error = pose_error[3:]
+                velocity_error = velocity - self.velocity_reference
                 scale = self.terminal_scale
                 terms = {
                     "se3_tracking": scale
@@ -170,7 +178,7 @@ class SE3DynamicActionModel:
                     "velocity": self.terminal_scale
                     * 0.5
                     * self.weights["velocity"]
-                    * float(velocity @ velocity),
+                    * float(velocity_error @ velocity_error),
                     "torque": 0.0
                     if self.terminal
                     else self.terminal_scale
@@ -292,7 +300,9 @@ class SE3DynamicActionModel:
                 data.Lxx[: self.nq, : self.nq] += posture_weight * np.eye(self.nq)
 
                 velocity_weight = self.terminal_scale * self.weights["velocity"]
-                data.Lx[self.nq : self.nq + self.nv] += velocity_weight * velocity
+                data.Lx[self.nq : self.nq + self.nv] += velocity_weight * (
+                    velocity - self.velocity_reference
+                )
                 data.Lxx[self.nq : self.nq + self.nv, self.nq : self.nq + self.nv] += (
                     velocity_weight * np.eye(self.nv)
                 )
