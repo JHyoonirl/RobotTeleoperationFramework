@@ -26,19 +26,19 @@ crocoddyl_mpc:
     goal: [0.2, -0.3, -1.2, 0.2, -1.4, 0.15]
 
     # MPC discretization and solver budget.
-    horizon: 20
-    dt: 0.005  # 200 Hz, matching ros2_control; DCP3 feedback/commands use 400 Hz.
+    horizon: 10
+    dt: 0.01  # 100 Hz MPC, 100 ms preview; ros2_control stays at 200 Hz.
     joint_state_timeout: 0.5
     max_solver_iterations: 7
 
-    # MPC cost weights: SE(3) tracking + posture + velocity + torque
+    # MPC cost weights: SE(3) tracking + posture + velocity + (torque - gravity)
     # + soft joint-limit avoidance.
     # Favor task-space accuracy moderately more than the previous profile.
     # The command rate/increment limits below remain the hard per-cycle bounds.
     se3_position_cost_weight: 15000.0
     se3_orientation_cost_weight: 1500.0
     posture_cost_weight: 0.05
-    # Lower velocity damping to reduce lag while keeping torque cost/limits intact.
+    # Track the generated path velocity; zero is used only after the path ends.
     velocity_cost_weight: 0.10
     torque_cost_weight: 0.0001
     joint_limit_cost_weight: 10.0
@@ -67,6 +67,9 @@ crocoddyl_mpc:
     # position limits and the measured-q +/- min(v_max*dt, increment) window.
     command_velocity_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
     command_increment_limits: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+    # Blend successive absolute position plans before all safety filters.
+    # 1.0 disables smoothing; 0.75 was checked with 10/20 ms feedback delay.
+    command_smoothing_factor: 0.75
 
     # Horizontal floor in URDF world coordinates, applied to task_frame
     # (hand_tcp for the minimal Keyboard/Topic Pose GUI). Units: metres.
@@ -82,16 +85,14 @@ crocoddyl_mpc:
     cartesian_max_speed: 0.5
     cartesian_max_angular_speed: 3.0
     cartesian_speed_margin: 1.0
-    cartesian_min_duration: 0.10
+    cartesian_min_duration: 0.10  # Each smooth acceleration/deceleration ramp is half this.
     # Maximum TCP distance from the start-goal segment [m] (5 mm).
     # Applied after joint clipping, including the joint-linear step between commands.
     cartesian_path_tolerance: 0.005
     cartesian_reference_topic: mpc/cartesian_reference_pose
 
-    # Optional experiment: target-pose velocity as a bounded joint-velocity
-    # reference. Left off by default because the current bounded Cartesian
-    # reference already handles motion and qdot feedforward raised torque in
-    # offline moving-target comparisons.
+    # Optional alternative: raw input-pose velocity instead of the generated
+    # path velocity. Keep disabled for stage-consistent path tracking.
     pose_velocity_feedforward_enabled: false
     pose_velocity_feedforward_gain: 0.5
     pose_velocity_feedforward_filter_time_constant: 0.08
@@ -112,3 +113,7 @@ crocoddyl_mpc:
     # The Cartesian path guard additionally limits task-space commands.
     stationary_hold_position_tolerance: 0.002
     stationary_hold_orientation_tolerance: 0.01
+    # Simulation uses this * duration as the allowed per-joint measured/command
+    # span; hardware additionally requires the instantaneous speed below it.
+    stationary_hold_velocity_tolerance: 0.03  # per-joint rad/s
+    stationary_hold_duration: 0.10           # settled continuously for 100 ms

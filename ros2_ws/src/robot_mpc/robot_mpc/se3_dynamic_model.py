@@ -158,6 +158,9 @@ class SE3DynamicActionModel:
                 q = np.asarray(x[: self.nq], dtype=float)
                 velocity = np.asarray(x[self.nq : self.nq + self.nv], dtype=float)
                 torque = np.asarray(u, dtype=float)
+                # Holding against gravity must not compete with pose tracking.
+                gravity = self.pin.computeGeneralizedGravity(self.model, self.pin_data, q)
+                torque_error = torque - gravity
                 pose_error = self._pose_error(q)
                 position_error = pose_error[:3]
                 orientation_error = pose_error[3:]
@@ -184,7 +187,7 @@ class SE3DynamicActionModel:
                     else self.terminal_scale
                     * 0.5
                     * self.weights["torque"]
-                    * float(torque @ torque),
+                    * float(torque_error @ torque_error),
                 }
                 terms["joint_limit"] = self.terminal_scale * self._joint_limit_terms(q)[0]
                 path_error, _ = self._path_error()
@@ -309,7 +312,19 @@ class SE3DynamicActionModel:
 
                 if not self.terminal:
                     torque_weight = self.terminal_scale * self.weights["torque"]
-                    data.Lu[:] = torque_weight * torque
+                    gravity = self.pin.computeGeneralizedGravity(
+                        self.model, self.pin_data, q
+                    ).copy()
+                    gravity_jacobian = self.pin.computeGeneralizedGravityDerivatives(
+                        self.model, self.pin_data, q
+                    )
+                    torque_error = torque - gravity
+                    data.Lx[: self.nq] -= torque_weight * gravity_jacobian.T @ torque_error
+                    data.Lxx[: self.nq, : self.nq] += torque_weight * (
+                        gravity_jacobian.T @ gravity_jacobian
+                    )
+                    data.Lxu[: self.nq, :] = -torque_weight * gravity_jacobian.T
+                    data.Lu[:] = torque_weight * torque_error
                     data.Luu[:] = torque_weight * np.eye(self.nv)
 
                 _, limit_gradient, limit_hessian = self._joint_limit_terms(q)

@@ -3,6 +3,19 @@
 import numpy as np
 
 
+def smooth_path_progress(alpha, ramp_fraction):
+    """Integrate cubic speed ramps around a constant-speed middle section."""
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    ramp = float(np.clip(ramp_fraction, 1.0e-12, 0.5))
+    if alpha < ramp:
+        u = alpha / ramp
+        return ramp * (u**3 - 0.5 * u**4) / (1.0 - ramp)
+    if alpha > 1.0 - ramp:
+        u = (1.0 - alpha) / ramp
+        return 1.0 - ramp * (u**3 - 0.5 * u**4) / (1.0 - ramp)
+    return (alpha - 0.5 * ramp) / (1.0 - ramp)
+
+
 def segment_error(position, start, goal):
     """Return distance residual and its position Jacobian for a closed segment."""
     direction = np.asarray(goal) - start

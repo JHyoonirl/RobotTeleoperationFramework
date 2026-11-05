@@ -17,7 +17,6 @@ def create_window(node):
     try:
         from PyQt5.QtCore import QEvent, QTimer, Qt
         from PyQt5.QtWidgets import (
-            QApplication,
             QCheckBox,
             QComboBox,
             QDoubleSpinBox,

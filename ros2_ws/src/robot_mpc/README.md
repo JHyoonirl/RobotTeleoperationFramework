@@ -64,11 +64,11 @@ FORCE_COLCON_BUILD=1 make docker-shell-robot-sim
 
 ## World Z floor
 
-The MPC keeps the controlled `task_frame` at **world Z >= 0.10 m** by default.
+The experiment YAML keeps the controlled `task_frame` at **world Z >= 0.15 m**.
 In the minimal GUI this frame is `hand_tcp`, for both Keyboard and Topic Pose.
 The Desired TCP and shared `hand_target` remain the exact requested poses, even
 below the floor. Only the private MPC tracking/path reference projects a lower
-Z goal up to 0.101 m; its X/Y and orientation still follow the requested pose.
+Z goal up to 0.151 m; its X/Y and orientation still follow the requested pose.
 Each running and terminal MPC stage also has a height penalty with 1 mm
 clearance to guide feasible motion. The final joint-position filter certifies
 the full joint-linear command step, including poses between its endpoints, and
@@ -80,7 +80,7 @@ launch after editing them:
 
 ```yaml
 workspace_floor_enabled: true
-workspace_min_z: 0.10             # metres in URDF world
+workspace_min_z: 0.15             # metres in URDF world
 workspace_floor_margin: 0.001     # planning clearance above the hard plane
 workspace_floor_cost_weight: 1000000.0
 ```
@@ -92,6 +92,130 @@ state. Command status reports `workspace_floor_limited`, `workspace_floor_hold`,
 or `workspace_floor_violation` when applicable. The limit concerns the TCP point,
 not every robot/hand link. It bounds MPC commands; physical tracking error and
 motion generated outside this MPC are not covered by this check.
+
+## MPC tracking and timing
+
+The actuator interface accepts absolute joint angles. The full-dynamics MPC
+generates a position trajectory; its optimized torques are internal predictions,
+not measured or commanded motor torques. A physical torque bound cannot be
+inferred from the internal box constraints without identifying the position
+servo and its tracking error.
+
+The default MPC runs at **100 Hz** (`dt: 0.01`, `horizon: 10`), preserving the
+100 ms preview while halving the shooting stages. ros2_control remains at
+200 Hz and DCP3 retains its own communication rate. Changing the MPC timer
+does not change those rates. Previous state/control plans are shifted one stage
+before each solve. A 10 ms timer is a requested period, not a hard execution
+deadline; check callback time on the deployment machine.
+
+The position-command boundary relaxes successive plans with
+`command_smoothing_factor: 0.75`: 75% of the new position plan plus 25% of the
+previous emitted command. During normal tracking, the generated path's joint
+velocity compensates the smoothing lag by adding `0.25 * dt * v_reference`.
+Hold and fallback commands omit this motion feedforward. All position, rate,
+increment, path and floor filters run after this step. F6 synchronization and
+F7 pause/resume re-anchor the previous command to the aligned/measured joints.
+Changing the smoothing factor requires a restart; `1.0` disables relaxation.
+
+By default, each stage tracks the joint velocity obtained from the generated
+Cartesian path's translational and angular increments through a damped
+Jacobian inverse. It becomes zero when the path ends and is bounded by the
+joint velocity and command-increment limits. The optional
+`pose_velocity_feedforward_enabled` experiment instead uses filtered raw input
+motion; leave it false for generated-path velocity tracking.
+
+The path uses cubic speed ramps with a constant-speed middle section, giving
+zero speed and acceleration at the endpoints of a fixed-target segment.
+Each ramp lasts half `cartesian_min_duration` (50 ms in the experiment YAML).
+The planned duration includes the ramps so the original linear/angular speed
+caps are respected. This adds braking time instead of reducing cruise speed;
+changing a streamed goal can still change the current path.
+
+Torque regularization is now `0.5 * w * ||tau - g(q)||^2`. Gravity compensation
+has zero torque penalty at every predicted configuration. Dynamics and box
+limits still use total torque. The cost derivatives include the gravity
+Jacobian and state/control cross term.
+
+The simulation hold requires the measured pose to remain within 2 mm and
+0.01 rad of the projected goal for 100 ms. Over that window, each measured
+joint position and each joint command must span at most
+`stationary_hold_velocity_tolerance * stationary_hold_duration` (0.003 rad).
+This rejects real joint/command motion without waiting indefinitely for the
+mock feedback velocity filter to decay. Stable simulation windows also prevent
+that velocity estimate alone from restarting the solver. Pose drift beyond
+twice the entry tolerances or a changed target resumes optimization. Identical
+repeated targets do not restart settling. Hardware mode additionally retains
+the instantaneous 0.03 rad/s speed condition and stationary-solver check.
+These are empirical switching thresholds, not terminal stability conditions.
+
+The 5 mm path tube and floor command filters remain enforced. For example, a
+forward command that also moves 6 mm sideways is corrected or shortened before
+publication. If measured feedback is already 6 mm outside the tube, the
+controller holds instead of inventing an uncertified return path. That is a
+different failure from ordinary along-path tracking lag, which does not count
+as lateral deviation. Look for `cartesian_path_limited`, `cartesian_path_hold`,
+or `cartesian_path_violation` when diagnosing slow motion.
+
+Terminal weights cannot be compared between papers without matching the cost
+units, discretization, preview and low-level plant. In
+[Nubert et al., RA-L 2020](https://arxiv.org/html/1912.10360), the terminal cost
+is an LQR infinite-horizon value, combined with a terminal set and robust
+constraint tightening. The manipulator paper
+[Incremental MPC Exploiting Time-Delay Estimation, TCST 2022](https://doi.org/10.1109/TCST.2022.3142629)
+instead develops tracking MPC without terminal ingredients, under its own
+model and stability assumptions. Our scalar terminal multiplier is empirical
+and does not reproduce either guarantee. Before the landing and position-command
+updates, sweeping 10, 1 and 0.1 in the local
+tracking comparison produced moving-target RMS errors of 2.364, 2.366 and
+2.370 mm respectively, so **10 is retained** rather than changing it solely
+because of its ratio to the integrated running cost.
+
+Local before/after checks used the repository URDF, ideal joint-position
+tracking, a fixed simulation step, and two seconds per scenario; no ROS or
+hardware delay was simulated. The moving goal was updated at 50 Hz along a
+0.5 Hz curve with 30 mm X and 20 mm Y amplitudes. Solver timing excludes
+reference generation, diagnostics, command filtering and publishing. Hold
+switching was disabled in this comparison to exercise the optimizer throughout.
+
+| Metric | Previous 200 Hz / 20 stages | Updated 100 Hz / 10 stages |
+| --- | ---: | ---: |
+| Moving-goal RMS position error | 2.706 mm | 2.567 mm |
+| Moving-goal solver median | 5.03 ms | 2.89 ms |
+| Moving-goal solver 95th percentile | 5.58 ms | 2.93 ms |
+| 50 mm X move, first error below 2 mm | 0.11 s | 0.14 s |
+| Startup goal, first pose within 2 mm / 0.01 rad | 0.525 s | 0.560 s |
+
+These results support lower computation latency and improved moving-target
+tracking, not a claim that every point-to-point motion is faster. Physical
+servo lag and the full callback execution time still need measurement. Rebuild
+the package/container and restart the launch to apply the Python, timer and
+hold changes; cost-YAML hot reload alone is insufficient.
+
+The arrival update also has regression checks with residual estimated speeds
+that alternate above the hold threshold, bounded measured/command motion, and
+separate cases that must refuse hold while measured joints or commands move.
+A zero-delay mock-feedback run settled with both versions and did not reproduce
+the RViz problem. Adding a single 10 ms feedback delay reproduced sustained
+oscillation with smoothing disabled, even with stationary hold disabled.
+The regression in `test_position_servo_closed_loop.py` runs the real callback,
+position plant, timestamped feedback and velocity filter over four seconds.
+It checks fixed goals with 0/10/20 ms feedback delay, the recorded initial
+posture, moving targets and rotation, with hold disabled throughout.
+
+An independent headless ros2_control/GenericSystem run used a delayed
+JointState relay in localhost-only ROS domain 98. With the same captured
+starting joints and fixed goal, and hold disabled for the entire test, the
+last two seconds of the 18-second 10 ms-delay runs gave:
+
+| Metric | Smoothing disabled | Smoothing 0.75 |
+| --- | ---: | ---: |
+| Largest per-joint position span | 16.79 degrees | < 0.001 degree |
+| Maximum TCP position error | 28.835 mm | 0.006 mm |
+
+The 20 ms-delay run also converged without hold. These are ideal position-servo
+tests, not physical-robot guarantees. The output relaxation addresses the
+observed delayed-feedback instability; it does not identify the hardware servo
+or make internal torque bounds equivalent to real motor torque bounds.
 
 ## F6 robot connection (DCP3 TELE_OP)
 

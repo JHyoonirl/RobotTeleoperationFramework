@@ -300,42 +300,25 @@ docker run --rm --net=host --ipc=host \
 기본 목적함수는 다음과 같다.
 
 ```text
-J = J_SE3 + J_cartesian_path + J_posture + J_velocity + J_torque + J_joint_limit
+J = dt * sum(running_cost) + terminal_cost
+running_cost = J_SE3 + J_cartesian_path + J_workspace_floor
+             + J_posture + J_velocity + J_torque + J_joint_limit
 ```
 
-위치/자세 weight는 각각 `20.0/5.0`, posture `0.1`, velocity `1.0`,
-torque `0.0001`, joint-limit `10.0`이다. terminal 단계에는
-`terminal_cost_weight=10.0`을 적용한다. `joint_limit_margin=0.2 rad` 안쪽을
-soft avoidance zone으로 사용하고, 실제 모델의 URDF limit은 시뮬레이션에서
-hard clip한다. cost는 정규화되지 않은 horizon 합이므로 horizon/weight를
-바꾸면 절대값도 바뀐다.
+실행 기본값은 [`indy7_mpc.yaml`](src/robot_mpc/config/indy7_mpc.yaml)에서 관리한다.
+중력 보상 토크는 `J_torque = 0.5 * w * ||tau - g(q)||²`로 비용에서 제외하며,
+terminal에는 토크 항이 없다. `joint_limit_margin`은 soft avoidance zone이고,
+최종 위치 명령에는 별도의 관절·속도·증분·경로·바닥 제한이 적용된다.
 
-goal 근처에서 떨리면 `velocity_cost_weight`, `torque_cost_weight`,
-`simulation_damping`을 키우고 `se3_*` 또는 `terminal_cost_weight`를 낮춰서
-시작한다. 시뮬레이션에서만 적용되는 acceleration smoothing도 조절할 수 있다.
+현재의 100 Hz 설정, 위치 명령 필터, 경로 속도 보상, 도착 판정과 검증 결과는
+[MPC tracking and timing](src/robot_mpc/README.md#mpc-tracking-and-timing)에 정리되어 있다.
+사용하지 않는 `simulation_damping`이나 `simulation_acceleration_smoothing`
+파라미터 대신 현재 YAML의 설정과 진단 로그를 기준으로 조정한다.
 
-```bash
-# my_experiment.yaml에서 다음처럼 조정한 뒤 다시 launch
-# se3_position_cost_weight: 12.0
-# se3_orientation_cost_weight: 4.0
-# ik_damping: 0.003
-# ik_step: 0.05
-# velocity_cost_weight: 2.0
-# torque_cost_weight: 0.001
-# terminal_cost_weight: 8.0
-# simulation_damping: 8.0
-# simulation_acceleration_smoothing: 0.15
-```
-
-`torque_cost_weight`를 너무 크게 하면 움직임이 둔해지고,
-`se3_*`를 너무 크게 하면 큰 `qddot`가 나올 수 있다. 실제 하드웨어에
-연결하기 전에는 반드시 별도의 position/velocity/acceleration 제한과
-안전 정지를 추가해야 한다.
-
-기본 다섯 항의 계산과 미분은 [`se3_dynamic_model.py`](src/robot_mpc/robot_mpc/se3_dynamic_model.py)에 있다. 실험별 weight는 YAML에서 바꾸고,
+비용 계산과 미분은 [`se3_dynamic_model.py`](src/robot_mpc/robot_mpc/se3_dynamic_model.py)에 있다. 실험별 weight는 YAML에서 바꾸고,
 새 residual을 추가할 때는 이 action model의 `_terms()`와 `calcDiff()`를
-함께 수정해야 한다. `custom_costs.py`는 기존 실험과의 호환을 위해 남겨둔
-확장 지점이다. URDF task frame 이름은 `tcp`다. Teleoperation pose 자체는
+함께 수정해야 한다. URDF task frame 이름은 `tcp`이고, Vive 연동 시에는
+`hand_tcp`를 사용한다. Teleoperation pose 자체는
 `teleop/target_pose`에서 실시간으로 갱신된다.
 
 시뮬레이션을 끄고 외부 joint state를 사용하려면:

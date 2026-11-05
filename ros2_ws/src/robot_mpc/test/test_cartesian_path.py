@@ -1,6 +1,7 @@
 """Geometry, continuous-step bounds and the actual post-clipping command guard."""
 
 from pathlib import Path
+from collections import deque
 import time
 from unittest.mock import Mock
 
@@ -12,7 +13,7 @@ import yaml
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import JointState
 
-from robot_mpc.cartesian_path import limit_cartesian_step, segment_error
+from robot_mpc.cartesian_path import limit_cartesian_step, segment_error, smooth_path_progress
 from robot_mpc.crocoddyl_mpc_node import CrocoddylMPCNode
 from robot_mpc.mpc_plotter import MpcPlotter
 from robot_mpc.se3_dynamic_model import SE3DynamicActionModel
@@ -84,6 +85,7 @@ def node():
     node.model, node.state = model, crocoddyl.StateMultibody(model)
     node.frame_id, node.pose_data = model.getFrameId("tcp"), model.createData()
     node.control_mode = "task_space"
+    node.simulate = True
     node.execution_enabled = True
     node.vive_control = None
     node.solve_count = 0
@@ -99,6 +101,7 @@ def node():
     node.dt = 0.02
     node.command_velocity_limits = np.ones(6)
     node.command_increment_limits = np.full(6, 0.02)
+    node.command_smoothing_factor = 0.75
     node.cartesian_path_tolerance = 0.0025
     node.cartesian_max_speed = 0.5
     node.cartesian_max_angular_speed = 3.0
@@ -112,6 +115,12 @@ def node():
     node.filtered_target_linear_velocity_world = np.zeros(3)
     node.filtered_target_angular_velocity_world = np.zeros(3)
     node.last_pose_velocity_feedforward = np.zeros(6)
+    node.stationary_hold_velocity_tolerance = 0.03
+    node.stationary_hold_duration = 0.10
+    node._stationary_hold_since = None
+    node._stationary_hold_candidate_target_count = -1
+    node._stationary_hold_samples = deque()
+    node.last_q_cmd = None
     node.cartesian_reach_bound = sum(np.linalg.norm(p.translation) for p in model.jointPlacements)
     node.cartesian_reach_bound += np.linalg.norm(model.frames[node.frame_id].placement.translation)
     node.sim_q = np.array([0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
@@ -148,6 +157,19 @@ def test_joint_mode_keeps_existing_command_limits(node):
     assert node.cartesian_command_scale == 1.0
 
 
+def test_position_smoothing_preserves_planned_constant_velocity(node):
+    node.control_mode = "joint"
+    node.dt = 0.01
+    node.last_q_cmd = node.sim_q.copy()
+    velocity = np.full(6, 0.2)
+    predicted = node.last_q_cmd + node.dt * velocity
+    command = node._safe_joint_command(predicted, np.r_[node.sim_q, np.zeros(6)], velocity)
+    np.testing.assert_allclose(command, predicted, atol=1e-12)
+    # Hold/fallback callers omit motion feedforward.
+    held = node._safe_joint_command(predicted, np.r_[node.sim_q, np.zeros(6)])
+    np.testing.assert_allclose(held - node.last_q_cmd, 0.75 * node.dt * velocity, atol=1e-12)
+
+
 @pytest.mark.parametrize("simulate, expected_velocity", [(True, 0.5), (False, 200.0)])
 @pytest.mark.parametrize("dt", [0.005, 0.01])
 @pytest.mark.parametrize("paused", [False, True])
@@ -176,7 +198,9 @@ def test_mock_velocity_uses_consumed_sample_interval_and_real_feedback_is_preser
 
 
 @pytest.mark.parametrize("simulate", [True, False])
-def test_mock_holds_at_target_without_requiring_a_zero_step_solver_result(node, simulate):
+def test_mock_holds_after_settling_and_resumes_outside_hysteresis(node, simulate, monkeypatch):
+    clock = [time.monotonic()]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
     node.simulate = simulate
     node.internal_simulation = False
     node.latest_state = np.r_[node.sim_q, np.zeros(6)]
@@ -205,6 +229,12 @@ def test_mock_holds_at_target_without_requiring_a_zero_step_solver_result(node, 
         node.solver.solve.assert_called_once()
         node._publish_stationary_hold.assert_not_called()
         return
+    # Being close to the target once does not prove that motion has settled.
+    node.solver.solve.assert_called_once()
+    node._publish_stationary_hold.assert_not_called()
+    node.solver.solve.reset_mock()
+    clock[0] += 0.11
+    node._solve_once()
     node.solver.solve.assert_not_called()
     held_q = node.stationary_hold_q.copy()
     assert node.stationary_hold_active
@@ -214,12 +244,129 @@ def test_mock_holds_at_target_without_requiring_a_zero_step_solver_result(node, 
     np.testing.assert_array_equal(node.stationary_hold_q, held_q)
     assert node._publish_stationary_hold.call_count == 2
     node.solver.solve.assert_not_called()
-    # A new target resumes optimization.
+    # A lagging/noisy velocity estimate cannot restart a spatially settled mock.
+    node.latest_state[6:] = 0.08
+    clock[0] += 0.01
+    node._solve_once()
+    assert node._publish_stationary_hold.call_count == 3
+    node.solver.solve.assert_not_called()
+    node.latest_state[6:] = 0.0
+    # Measured drift outside the outer tolerance resumes optimization.
+    node.latest_state[0] += 0.03
+    node._solve_once()
+    node.solver.solve.assert_called_once()
+    node.solver.solve.reset_mock()
+    # A new target also resumes optimization.
     node.target_pose.translation += np.array([0.02, 0.0, 0.0])
     node.target_update_count += 1
     node.stationary_hold_active = False
     node._solve_once()
     node.solver.solve.assert_called_once()
+
+
+def test_hold_requires_low_velocity_and_restarts_dwell_on_target_change(node, monkeypatch):
+    node.simulate = False
+    clock = [0.0]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    node.stationary_hold_position_tolerance = 0.002
+    node.stationary_hold_orientation_tolerance = 0.01
+    node.target_update_count = 1
+    state = np.r_[node.sim_q, np.zeros(6)]
+    state[6] = 0.1
+    assert not node._stationary_hold_ready(state, np.zeros(6))
+    clock[0] = 1.0
+    state[6] = 0.0
+    assert not node._stationary_hold_ready(state, np.zeros(6))
+    clock[0] = 1.11
+    assert node._stationary_hold_ready(state, np.zeros(6))
+    node.target_update_count += 1
+    assert not node._stationary_hold_ready(state, np.zeros(6))
+
+
+def test_mock_hold_can_settle_despite_lagging_velocity_estimate(node, monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    node.stationary_hold_position_tolerance = 0.002
+    node.stationary_hold_orientation_tolerance = 0.01
+    node.target_update_count = 1
+    state = np.r_[node.sim_q, np.zeros(6)]
+    ready = False
+    for step in range(12):
+        clock[0] = step * 0.01
+        # The logged symptom: residual estimated speed flips above 0.03 rad/s.
+        state[6:] = (-1.0)**step * 0.04
+        state[0] = node.sim_q[0] + (-1.0)**step * 0.0005
+        node.last_q_cmd = state[:6].copy()
+        ready = node._stationary_hold_ready(state, np.zeros(6))
+    assert ready
+
+
+@pytest.mark.parametrize("moving_command", [False, True])
+def test_hold_rejects_joint_or_command_motion_even_with_small_pose_error(
+    node, monkeypatch, moving_command
+):
+    clock = [0.0]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    node.stationary_hold_position_tolerance = 0.002
+    node.stationary_hold_orientation_tolerance = 0.01
+    node.target_update_count = 1
+    for step in range(20):
+        clock[0] = step * 0.01
+        state = np.r_[node.sim_q, np.zeros(6)]
+        node.last_q_cmd = node.sim_q.copy()
+        if moving_command:
+            node.last_q_cmd[0] += step * 0.001
+        else:
+            state[0] += step * 0.001
+        assert not node._stationary_hold_ready(state, np.zeros(6))
+
+
+@pytest.mark.parametrize("ramp", [0.1, 0.25, 0.5])
+def test_path_speed_ramps_are_continuous_and_bounded(ramp):
+    alpha = np.linspace(0.0, 1.0, 10001)
+    progress = np.array([smooth_path_progress(a, ramp) for a in alpha])
+    speed = np.diff(progress) / (alpha[1] - alpha[0])
+    assert progress[0] == 0.0
+    assert progress[-1] == 1.0
+    assert np.min(speed) >= 0.0
+    assert np.max(speed) <= 1.0 / (1.0 - ramp) + 1e-8
+    assert speed[0] < 1e-5
+    assert speed[-1] < 1e-5
+    for boundary in (ramp, 1.0 - ramp):
+        index = round(boundary * (len(alpha) - 1))
+        assert abs(speed[index] - speed[index - 1]) < 1e-4
+
+
+@pytest.mark.parametrize("rotate", [False, True])
+def test_generated_path_has_stage_velocity_and_stops_at_endpoint(node, rotate, monkeypatch):
+    clock = [0.01]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    node.horizon = 3
+    node.cartesian_speed_margin = 1.0
+    node.cartesian_min_duration = 0.1
+    node.cartesian_path_start_time = 0.0
+    node.pose_velocity_feedforward_enabled = False
+    if rotate:
+        node.target_pose = node.cartesian_path_start_pose.copy()
+        node.target_pose.rotation = node.target_pose.rotation @ pin.exp3(np.array([0.1, 0.0, 0.0]))
+    node.running_actions = [Mock() for _ in range(node.horizon)]
+    node.terminal_action = Mock()
+    node.xs = [np.r_[node.sim_q, np.zeros(6)] for _ in range(node.horizon + 1)]
+    node._update_cartesian_references(node.sim_q)
+    for action in [*node.running_actions, node.terminal_action]:
+        velocity = action.update_velocity_reference.call_args.args[0]
+        assert np.all(np.isfinite(velocity))
+        assert np.linalg.norm(velocity) > 0.0
+        assert np.all(np.abs(velocity) <= node.command_velocity_limits + 1e-12)
+    samples = [node._interpolate_cartesian_pose(a) for a in np.linspace(0.0, 1.0, 101)]
+    interval = node.cartesian_path_duration / 100.0
+    for start, end in zip(samples, samples[1:]):
+        assert np.linalg.norm(end.translation - start.translation) / interval <= node.cartesian_max_speed + 1e-8
+        assert np.linalg.norm(pin.log3(end.rotation @ start.rotation.T)) / interval <= node.cartesian_max_angular_speed + 1e-8
+    clock[0] = 10.0
+    node._update_cartesian_references(node.sim_q)
+    for action in [*node.running_actions, node.terminal_action]:
+        np.testing.assert_array_equal(action.update_velocity_reference.call_args.args[0], np.zeros(6))
 
 
 def test_measured_path_violation_holds_and_reports_failure(node):
@@ -369,8 +516,8 @@ def test_identical_target_does_not_reanchor_an_expired_path(node):
     node.cartesian_path_duration = 0.1
     node.latest_state = np.r_[node.sim_q, np.zeros(6)]
     node.last_target_update_monotonic = 0.0
-    node.previous_target_pose = None
     node.target_update_count = 0
+    node.stationary_hold_active = True
     node._solve_ik = Mock(side_effect=lambda target, seed: seed.copy())
     message = PoseStamped()
     message.header.frame_id = "world"
@@ -384,6 +531,8 @@ def test_identical_target_does_not_reanchor_an_expired_path(node):
     node._solve_ik.assert_not_called()
     np.testing.assert_array_equal(node.cartesian_path_start_pose.translation, original_start.translation)
     assert node.cartesian_path_start_time == 0.0
+    assert node.target_update_count == 0
+    assert node.stationary_hold_active
 
 
 def test_diagnostic_work_is_rate_limited(node, monkeypatch):

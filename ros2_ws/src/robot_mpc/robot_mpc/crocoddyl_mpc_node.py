@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import json
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -23,7 +24,9 @@ from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Float64MultiArray, String
 
-from .cartesian_path import limit_cartesian_step, project_cartesian_command, segment_error
+from .cartesian_path import (
+    limit_cartesian_step, project_cartesian_command, segment_error, smooth_path_progress,
+)
 from .mpc_diagnostics import MpcDiagnosticsMixin
 from .mpc_cost_config import apply_runtime_cost_settings, load_runtime_cost_settings
 from .se3_dynamic_model import SE3DynamicActionModel
@@ -50,8 +53,8 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.declare_parameter("nominal_posture", [0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
         self.declare_parameter("goal_position", [0.555628, -0.028394, 0.500983])
         self.declare_parameter("goal_orientation_xyzw", [-0.019703, 0.987570, 0.119061, 0.100709])
-        self.declare_parameter("horizon", 20)
-        self.declare_parameter("dt", 0.005)
+        self.declare_parameter("horizon", 10)
+        self.declare_parameter("dt", 0.01)
         self.declare_parameter("max_solver_iterations", 10)
         self.declare_parameter("simulate", False)
         self.declare_parameter("initialize_target_from_current_state", False)
@@ -76,6 +79,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.declare_parameter("internal_simulation", False)
         self.declare_parameter("command_velocity_limits", [1.0] * 6)
         self.declare_parameter("command_increment_limits", [0.02] * 6)
+        self.declare_parameter("command_smoothing_factor", 0.75)
         self.declare_parameter("workspace_floor_enabled", True)
         self.declare_parameter("workspace_min_z", 0.10)
         self.declare_parameter("workspace_floor_margin", 0.001)
@@ -125,6 +129,8 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.declare_parameter("diagnostic_log_prediction", False)
         self.declare_parameter("stationary_hold_position_tolerance", 2.0e-4)
         self.declare_parameter("stationary_hold_orientation_tolerance", 1.5e-3)
+        self.declare_parameter("stationary_hold_velocity_tolerance", 0.03)
+        self.declare_parameter("stationary_hold_duration", 0.10)
 
         try:
             import crocoddyl
@@ -212,6 +218,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.command_increment_limits = self._parse_vector(
             self.get_parameter("command_increment_limits").value, 6
         )
+        self.command_smoothing_factor = float(self.get_parameter("command_smoothing_factor").value)
         self.cartesian_max_speed = float(
             self.get_parameter("cartesian_max_speed").value
         )
@@ -308,6 +315,12 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.stationary_hold_orientation_tolerance = float(
             self.get_parameter("stationary_hold_orientation_tolerance").value
         )
+        self.stationary_hold_velocity_tolerance = float(
+            self.get_parameter("stationary_hold_velocity_tolerance").value
+        )
+        self.stationary_hold_duration = float(
+            self.get_parameter("stationary_hold_duration").value
+        )
         self.internal_simulation = self._as_bool(
             self.get_parameter("internal_simulation").value
         )
@@ -336,6 +349,8 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             raise ValueError("command_velocity_limits는 양수인 6개 값이어야 합니다.")
         if np.any(self.command_increment_limits <= 0.0):
             raise ValueError("command_increment_limits는 양수인 6개 값이어야 합니다.")
+        if not np.isfinite(self.command_smoothing_factor) or not 0.0 < self.command_smoothing_factor <= 1.0:
+            raise ValueError("command_smoothing_factor must be finite and in (0, 1]")
         if np.any(self.torque_limits <= 0.0) or not np.all(np.isfinite(self.torque_limits)):
             raise ValueError("torque_limits는 양수인 6개 유한값이어야 합니다.")
         if (
@@ -389,11 +404,15 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         if (
             self.stationary_hold_position_tolerance <= 0.0
             or self.stationary_hold_orientation_tolerance <= 0.0
+            or self.stationary_hold_velocity_tolerance <= 0.0
+            or self.stationary_hold_duration <= 0.0
             or not np.all(
                 np.isfinite(
                     [
                         self.stationary_hold_position_tolerance,
                         self.stationary_hold_orientation_tolerance,
+                        self.stationary_hold_velocity_tolerance,
+                        self.stationary_hold_duration,
                     ]
                 )
             )
@@ -455,6 +474,9 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.stationary_hold_target_count = -1
         self.stationary_hold_q: np.ndarray | None = None
         self.stationary_hold_cost = float("nan")
+        self._stationary_hold_since = None
+        self._stationary_hold_candidate_target_count = -1
+        self._stationary_hold_samples = deque()
 
         # Both ros2_control simulation and the real driver expose joint_states.
         # A solve can exceed dt; queued feedback would make the controller chase old states.
@@ -497,22 +519,13 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.control_norm_pub = self.create_publisher(Float64, "mpc/control_norm", 10)
         self.cost_term_pubs = {
             name: self.create_publisher(Float64, f"mpc/cost/{name}", 10)
-            for name in (
-                "se3_tracking",
-                "cartesian_path",
-                "workspace_floor",
-                "posture",
-                "velocity",
-                "torque",
-                "joint_limit",
-            )
+            for name in self.running_action.cost_names
         }
         self.terminal_cost_pub = self.create_publisher(Float64, "mpc/terminal_cost", 10)
         self.solve_count = 0
         self.target_update_count = 0
         self.last_target_update_monotonic = float("nan")
         self.last_target_stamp_s = float("nan")
-        self.previous_target_pose = self.target_pose.copy()
         self.last_target_update_dt = float("nan")
         self.last_target_delta_rotation_world = np.zeros(3)
         self.last_target_linear_velocity_world = np.zeros(3)
@@ -771,8 +784,10 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         return self.cartesian_max_speed
 
     def _interpolate_cartesian_pose(self, alpha: float):
-        """Interpolate position linearly and orientation on SO(3)."""
-        alpha = float(np.clip(alpha, 0.0, 1.0))
+        """Follow the same SE(3) path with continuous speed and acceleration."""
+        alpha = smooth_path_progress(
+            alpha, 0.5 * self.cartesian_min_duration / self.cartesian_path_duration
+        )
         start = self.cartesian_path_start_pose
         goal = self._optimization_target_pose()
         position = (1.0 - alpha) * start.translation + alpha * goal.translation
@@ -799,8 +814,8 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             )
             rotation_angle = float(np.linalg.norm(rotation_delta))
             self.cartesian_path_duration = max(
-                distance / max(self.cartesian_path_speed, 1.0e-9),
-                rotation_angle / max(self.cartesian_max_angular_speed, 1.0e-9),
+                distance / max(self.cartesian_path_speed, 1.0e-9) + 0.5 * self.cartesian_min_duration,
+                rotation_angle / max(self.cartesian_max_angular_speed, 1.0e-9) + 0.5 * self.cartesian_min_duration,
                 self.cartesian_min_duration,
             )
             elapsed = max(0.0, time.monotonic() - self.cartesian_path_start_time)
@@ -821,22 +836,56 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
                 )[0])
             )
 
-        velocity_reference = self._joint_velocity_feedforward(q)
-        for action, reference_pose in zip(
-            self.running_actions, self.cartesian_reference_poses[:-1]
-        ):
+        # Differentiate the bounded path, rather than damping motion toward zero.
+        # The optional raw-input experiment remains an alternative, not an addition.
+        velocity_reference = (
+            self._joint_velocity_feedforward(q)
+            if self.pose_velocity_feedforward_enabled else None
+        )
+        next_poses = self.cartesian_reference_poses[1:] + [
+            self._interpolate_cartesian_pose((stage_times[-1] + self.dt) / self.cartesian_path_duration)
+            if self.control_mode == "task_space" else self.cartesian_reference_poses[-1]
+        ]
+        actions = [*self.running_actions, self.terminal_action]
+        for index, (action, reference_pose, next_pose) in enumerate(zip(
+            actions, self.cartesian_reference_poses, next_poses
+        )):
             action.update_target(reference_pose)
             action.update_path(
                 self.cartesian_path_start_pose.translation,
                 self._optimization_target_pose().translation,
             )
-            action.update_velocity_reference(velocity_reference)
-        self.terminal_action.update_target(self.cartesian_reference_poses[-1])
-        self.terminal_action.update_path(
-            self.cartesian_path_start_pose.translation,
-            self._optimization_target_pose().translation,
+            predicted_q = q
+            if index and hasattr(self, "xs"):
+                # The previous solution will be shifted before the next solve.
+                predicted_q = self.xs[min(index + 1, self.horizon)][:self.model.nq]
+                if not np.all(np.isfinite(predicted_q)):
+                    predicted_q = q
+            action.update_velocity_reference(
+                velocity_reference if velocity_reference is not None
+                else self._reference_joint_velocity(predicted_q, reference_pose, next_pose)
+            )
+
+    def _reference_joint_velocity(self, q, reference_pose, next_pose):
+        """Map a stage's world-frame path twist to bounded joint velocity."""
+        twist = np.r_[
+            (next_pose.translation - reference_pose.translation) / self.dt,
+            self.pin.log3(next_pose.rotation @ reference_pose.rotation.T) / self.dt,
+        ]
+        if np.linalg.norm(twist) < 1.0e-10:
+            return np.zeros(self.model.nv)
+        self.pin.computeJointJacobians(self.model, self.pose_data, q)
+        self.pin.updateFramePlacements(self.model, self.pose_data)
+        jacobian = self.pin.getFrameJacobian(
+            self.model, self.pose_data, self.frame_id, self.pin.LOCAL_WORLD_ALIGNED
         )
-        self.terminal_action.update_velocity_reference(velocity_reference)
+        velocity = jacobian.T @ np.linalg.solve(
+            jacobian @ jacobian.T + self.pose_velocity_feedforward_damping**2 * np.eye(6),
+            twist,
+        )
+        limits = np.minimum(self.command_velocity_limits, self.command_increment_limits / self.dt)
+        ratio = float(np.max(np.abs(velocity) / limits))
+        return velocity / max(1.0, ratio)
 
     def _reset_pose_velocity_estimate(self, target_pose, now=None) -> None:
         """Prevent a synchronization or mode transition from becoming motion feedforward."""
@@ -1004,10 +1053,11 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         new_target = self.pin.SE3(self.pin.Quaternion(orientation).matrix(), position)
         update_now = time.monotonic()
         # Repeated identical targets must not reset a line while tracking lags.
-        if (
+        target_changed = (
             not np.allclose(new_target.translation, self.target_pose.translation, rtol=0.0, atol=1e-12)
             or np.linalg.norm(self.pin.log3(self.target_pose.rotation.T @ new_target.rotation)) > 1e-12
-        ):
+        )
+        if target_changed:
             seed = self.latest_state[: self.model.nq] if self.latest_state is not None else self.sim_q
             current_pose = self._tcp_pose(seed).copy()
             mpc_target = self._optimization_target_pose(new_target)
@@ -1024,9 +1074,9 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
                 self.cartesian_path_start_time = update_now
         self._update_pose_velocity_estimate(new_target, update_now)
         self.target_pose = new_target
-        self.previous_target_pose = new_target.copy()
-        self.target_update_count += 1
-        self.stationary_hold_active = False
+        if target_changed:
+            self.target_update_count += 1
+            self.stationary_hold_active = False
         self.last_target_update_monotonic = update_now
         self.last_target_stamp_s = (
             float(message.header.stamp.sec)
@@ -1128,7 +1178,6 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         if not self.initial_target_state_initialized:
             current_pose = self._tcp_pose(position).copy()
             self.target_pose = current_pose
-            self.previous_target_pose = current_pose.copy()
             self._reset_pose_velocity_estimate(current_pose)
             self.cartesian_path_start_pose = current_pose.copy()
             self.cartesian_path_start_time = time.monotonic()
@@ -1202,7 +1251,6 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             current_pose.copy() for _ in range(self.horizon + 1)
         ]
         self.target_pose = target_pose
-        self.previous_target_pose = target_pose.copy()
         self._reset_pose_velocity_estimate(target_pose, now)
         self.xref = np.r_[target_q, np.zeros(self.model.nv)]
         state_reference = np.r_[target_q, np.zeros(self.model.nv)]
@@ -1210,6 +1258,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         self.us = [np.zeros(self.model.nv) for _ in range(self.horizon)]
         self.stationary_hold_active = False
         self.stationary_hold_q = None
+        self.last_q_cmd = target_q.copy()
         self.target_update_count += 1
         self.last_target_update_monotonic = now
         self.last_target_stamp_s = (
@@ -1264,6 +1313,40 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             return "non_finite_prediction"
         return ""
 
+    def _stationary_hold_ready(self, state, pose_error):
+        """Check measured/command motion over a dwell, despite mock velocity lag."""
+        settled = (
+            np.linalg.norm(pose_error[:3]) <= self.stationary_hold_position_tolerance
+            and np.linalg.norm(pose_error[3:]) <= self.stationary_hold_orientation_tolerance
+            and (self.simulate or np.max(np.abs(state[self.model.nq:]))
+                 <= self.stationary_hold_velocity_tolerance)
+        )
+        if not settled:
+            self._stationary_hold_since = None
+            return False
+        now = time.monotonic()
+        if (self._stationary_hold_since is None
+                or self._stationary_hold_candidate_target_count != self.target_update_count):
+            self._stationary_hold_since = now
+            self._stationary_hold_candidate_target_count = self.target_update_count
+            self._stationary_hold_samples.clear()
+        q = np.asarray(state[:self.model.nq])
+        command = self.last_q_cmd if self.last_q_cmd is not None else q
+        self._stationary_hold_samples.append((now, q.copy(), command.copy()))
+        while (len(self._stationary_hold_samples) > 1
+               and self._stationary_hold_samples[1][0] <= now - self.stationary_hold_duration):
+            self._stationary_hold_samples.popleft()
+        elapsed = now - self._stationary_hold_samples[0][0]
+        if elapsed < self.stationary_hold_duration:
+            return False
+        measured = np.array([sample[1] for sample in self._stationary_hold_samples])
+        commands = np.array([sample[2] for sample in self._stationary_hold_samples])
+        motion_budget = self.stationary_hold_velocity_tolerance * self.stationary_hold_duration
+        return bool(
+            np.max(np.ptp(measured, axis=0)) <= motion_budget
+            and np.max(np.ptp(commands, axis=0)) <= motion_budget
+        )
+
     def _publish_stationary_hold(self, state: np.ndarray) -> None:
         """Keep the last command without invoking FDDP again."""
         if self.stationary_hold_q is not None and np.all(np.isfinite(self.stationary_hold_q)):
@@ -1315,9 +1398,9 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         if self.latest_state is None:
             return
         q = self.latest_state[:self.model.nq].copy()
+        self.last_q_cmd = q.copy()
         current = self._tcp_pose(q).copy()
         self.target_pose = current
-        self.previous_target_pose = current.copy()
         self._reset_pose_velocity_estimate(current)
         self.cartesian_path_start_pose = current.copy()
         self.cartesian_path_start_time = time.monotonic()
@@ -1377,6 +1460,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
 
         state_age = time.monotonic() - self.last_state_update_monotonic
         if not np.isfinite(state_age) or state_age > self.joint_state_timeout:
+            self._stationary_hold_since = None
             self._paused_alignment_target = None
             if self.execution_enabled:
                 self.solve_success_pub.publish(Float64(data=0.0))
@@ -1392,6 +1476,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
         if self.vive_control is not None:
             self.vive_control.before_solve()
         if not self.execution_enabled:
+            self._stationary_hold_since = None
             if self._paused_alignment_target is not None:
                 if (time.monotonic() > self._paused_alignment_deadline
                         or np.allclose(self.latest_state[:self.model.nq], self._paused_alignment_target,
@@ -1406,6 +1491,7 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
 
         state = self.latest_state.copy()
         if self._below_workspace_floor(state[:self.model.nq]):
+            self._stationary_hold_since = None
             self._publish_joint_command(state[:self.model.nq])
             self.solve_success_pub.publish(Float64(data=0.0))
             self.status_pub.publish(String(data="workspace_floor_violation"))
@@ -1419,15 +1505,20 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             self.cartesian_path_start_time = time.monotonic()
             self.cartesian_path_initialized_from_state = True
         self._update_cartesian_references(state[: self.model.nq])
+        hold_error = self._pose_error(
+            state[: self.model.nq], self._optimization_target_pose(), self.pose_data
+        )
+        hold_ready = self._stationary_hold_ready(state, hold_error)
+        hold_exit = (
+            np.linalg.norm(hold_error[:3]) > 2.0 * self.stationary_hold_position_tolerance
+            or np.linalg.norm(hold_error[3:]) > 2.0 * self.stationary_hold_orientation_tolerance
+            or (np.max(np.abs(state[self.model.nq:])) > 2.0 * self.stationary_hold_velocity_tolerance
+                and not (self.simulate and hold_ready))
+        )
+        if hold_exit:
+            self.stationary_hold_active = False
         if self.simulate and self.control_mode == "task_space" and not self.stationary_hold_active:
-            pose_error = self._pose_error(
-                state[: self.model.nq], self._optimization_target_pose(), self.pose_data
-            )
-            # The ideal position servo can stop on the measured pose without another torque solve.
-            if (
-                np.linalg.norm(pose_error[:3]) <= self.stationary_hold_position_tolerance
-                and np.linalg.norm(pose_error[3:]) <= self.stationary_hold_orientation_tolerance
-            ):
+            if hold_ready:
                 self.stationary_hold_active = True
                 self.stationary_hold_target_count = self.target_update_count
                 self.stationary_hold_q = state[: self.model.nq].copy()
@@ -1446,7 +1537,9 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             return
         self.stationary_hold_active = False
         self.problem.x0 = state
-        self.xs[0] = state.copy()
+        # Reuse the remaining plan one stage later, with the latest feedback at x0.
+        self.xs = [state.copy(), *[x.copy() for x in self.xs[2:]], self.xs[-1].copy()]
+        self.us = [*[u.copy() for u in self.us[1:]], self.us[-1].copy()]
         self.last_target_acceleration.fill(np.nan)
         self.last_applied_acceleration.fill(np.nan)
         diagnostics_due = self._diagnostics_due()
@@ -1497,14 +1590,13 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
                     solve_time_ms=solve_time_ms,
                 )
             return
-        self.xs, self.us = self.solver.xs, self.solver.us
+        # Some Crocoddyl bindings expose vectors without Python slice support.
+        self.xs = [x.copy() for x in self.solver.xs]
+        self.us = [u.copy() for u in self.solver.us]
         cost = solver_cost
         raw_control = np.asarray(self.us[0], dtype=float).copy()
         current_pose = self._tcp_pose(state[:6]).copy()
         task_error = self._pose_error(state[:6], self.target_pose, self.pose_data)
-        optimization_error = self._pose_error(
-            state[:6], self._optimization_target_pose(), self.pose_data
-        )
         if diagnostics_due:
             jacobian = self._jacobian_record(state[:6], current_pose)
             cost_terms = self.running_action.cost_terms(state, raw_control)
@@ -1560,17 +1652,16 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             else:
                 q_cmd = self._safe_joint_command(state[: self.model.nq], state)
         else:
-            q_cmd = self._safe_joint_command(next_state[: self.model.nq], state)
+            q_cmd = self._safe_joint_command(
+                next_state[: self.model.nq], state, self.running_action.velocity_reference
+            )
         prediction_guard = prediction_guard or self._command_guard()
         self.last_q_cmd = q_cmd.copy()
         self._publish_joint_command(q_cmd)
         stationary_hold_ready = bool(
             stationary_optimum
             and not prediction_guard
-            and float(np.linalg.norm(optimization_error[:3]))
-            <= self.stationary_hold_position_tolerance
-            and float(np.linalg.norm(optimization_error[3:]))
-            <= self.stationary_hold_orientation_tolerance
+            and hold_ready
         )
         solver_success = bool(solved or stationary_optimum)
         status = (
@@ -1617,7 +1708,9 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             )
         self._publish_command_pose(q_cmd)
 
-    def _safe_joint_command(self, predicted_q: np.ndarray, state: np.ndarray) -> np.ndarray:
+    def _safe_joint_command(
+        self, predicted_q: np.ndarray, state: np.ndarray, velocity_reference=None
+    ) -> np.ndarray:
         """Limit absolute q_cmd before it crosses the simulation/hardware boundary."""
         predicted_q = np.asarray(predicted_q, dtype=float)
         measured_q = np.asarray(state[: self.model.nq], dtype=float)
@@ -1625,6 +1718,12 @@ class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
             raise RuntimeError("MPC produced a non-finite joint-position command")
         if measured_q.shape != (self.model.nq,) or not np.all(np.isfinite(measured_q)):
             raise RuntimeError("joint state is invalid for a joint-position command")
+        # Relax successive position plans to tolerate delayed servo feedback.
+        anchor = measured_q if self.last_q_cmd is None else self.last_q_cmd
+        predicted_q = anchor + self.command_smoothing_factor * (predicted_q - anchor)
+        if velocity_reference is not None:
+            # Cancel smoothing lag for planned motion; hold/fallback calls omit it.
+            predicted_q += (1.0 - self.command_smoothing_factor) * self.dt * velocity_reference
         measured_q = np.clip(
             measured_q, self.model.lowerPositionLimit, self.model.upperPositionLimit
         )

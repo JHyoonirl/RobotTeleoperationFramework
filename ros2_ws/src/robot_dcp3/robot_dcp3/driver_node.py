@@ -108,7 +108,6 @@ class RobotDcp3Node(Node):
         self.arming = False
         self.arming_deadline = 0.0
         self.current_q: np.ndarray | None = None
-        self.current_qdot: np.ndarray | None = None
         self.current_op_state: int | None = None
         self.last_feedback_time = 0.0
         self.latest_command: np.ndarray | None = None
@@ -246,7 +245,6 @@ class RobotDcp3Node(Node):
             qdot = np.radians(joint_vector(control["qdot"], "DCP3 qdot feedback", self.dof))
             self.current_op_state = int(control["op_state"])
             self.current_q = q
-            self.current_qdot = qdot
             now = time.monotonic()
             self.last_feedback_time = now
             state = JointState()

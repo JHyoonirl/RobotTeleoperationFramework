@@ -56,6 +56,7 @@ class MpcDiagnosticsMixin:
                 "internal_simulation",
                 "command_velocity_limits",
                 "command_increment_limits",
+                "command_smoothing_factor",
                 "workspace_floor_enabled",
                 "workspace_min_z",
                 "workspace_floor_margin",
@@ -95,6 +96,8 @@ class MpcDiagnosticsMixin:
                 "diagnostic_log_prediction",
                 "stationary_hold_position_tolerance",
                 "stationary_hold_orientation_tolerance",
+                "stationary_hold_velocity_tolerance",
+                "stationary_hold_duration",
             )
             parameters = {
                 name: self.get_parameter(name).value for name in parameter_names

@@ -117,6 +117,39 @@ def session(monkeypatch, tmp_path):
         context.shutdown()
 
 
+def test_mpc_callbacks_reuse_solver_output_as_owned_python_lists(session):
+    mpc = session.mpc
+    mpc.vive_control = None
+    mpc.execution_enabled = True
+    mpc.initial_target_state_initialized = True
+    mpc.target_pose = mpc._tcp_pose(mpc.sim_q).copy()
+    mpc.target_pose.translation[0] += 0.05
+    mpc.cartesian_path_initialized_from_state = False
+    before = mpc.solve_count
+    for cycle in range(3):
+        mpc._solve_once()
+        assert mpc.solve_count == before + cycle + 1
+        assert isinstance(mpc.xs, list)
+        assert isinstance(mpc.us, list)
+        assert len(mpc.xs) == mpc.horizon + 1
+        assert len(mpc.us) == mpc.horizon
+        # Solver buffers may be overwritten on the next solve.
+        assert not np.shares_memory(mpc.xs[1], mpc.solver.xs[1])
+        assert not np.shares_memory(mpc.us[0], mpc.solver.us[0])
+        assert np.all(np.isfinite(mpc.last_q_cmd))
+
+
+def test_pause_and_resume_reanchor_position_smoothing_to_feedback(session):
+    mpc = session.mpc
+    measured = mpc.latest_state[:mpc.model.nq].copy()
+    mpc.last_q_cmd = measured + 0.1
+    mpc._set_execution_enabled(False)
+    np.testing.assert_array_equal(mpc.last_q_cmd, measured)
+    mpc.latest_state[0] += 0.01
+    mpc._set_execution_enabled(True)
+    np.testing.assert_array_equal(mpc.last_q_cmd, mpc.latest_state[:mpc.model.nq])
+
+
 def test_keyboard_uses_hand_target_without_a_tracker(session):
     s = session
     assert s.nodes[1].joint_command_rate == pytest.approx(200.0)

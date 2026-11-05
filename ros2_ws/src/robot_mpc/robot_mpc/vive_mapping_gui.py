@@ -14,7 +14,6 @@ from PyQt5.QtWidgets import (
     QHBoxLayout, QLabel, QMainWindow, QPushButton, QShortcut, QStackedWidget, QWidget,
 )
 from rclpy.executors import ExternalShutdownException, SingleThreadedExecutor
-from rclpy.node import Node
 
 from .vive_mapping_client import ViveMappingClient
 
