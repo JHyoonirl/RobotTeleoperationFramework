@@ -5,6 +5,8 @@
 crocoddyl_mpc:
   ros__parameters:
     # Primary controller: task-space SE(3) target on the URDF's tcp frame.
+    # Vive simulation following selects vive_hand_frame (hand_tcp) instead,
+    # so its tracking residual and Cartesian path both follow the hand.
     control_mode: task_space
     task_frame: tcp
     pose_frame: world
@@ -25,31 +27,36 @@ crocoddyl_mpc:
 
     # MPC discretization and solver budget.
     horizon: 20
-    dt: 0.005  # 200 Hz, matching ros2_control and DCP3 feedback/commands.
+    dt: 0.005  # 200 Hz, matching ros2_control; DCP3 feedback/commands use 400 Hz.
+    joint_state_timeout: 0.5
     max_solver_iterations: 7
 
     # MPC cost weights: SE(3) tracking + posture + velocity + torque
     # + soft joint-limit avoidance.
-    se3_position_cost_weight: 10000.0
-    se3_orientation_cost_weight: 1000.0
+    # Favor task-space accuracy moderately more than the previous profile.
+    # The command rate/increment limits below remain the hard per-cycle bounds.
+    se3_position_cost_weight: 15000.0
+    se3_orientation_cost_weight: 1500.0
     posture_cost_weight: 0.05
-    velocity_cost_weight: 0.25
+    # Lower velocity damping to reduce lag while keeping torque cost/limits intact.
+    velocity_cost_weight: 0.10
     torque_cost_weight: 0.0001
-    # Legacy key accepted by the node but unused by the dynamic predictor.
-    acceleration_cost_weight: 0.05
     joint_limit_cost_weight: 10.0
     running_cost_weight: 1.0
     terminal_cost_weight: 10.0
     nominal_posture: [0.0, 0.0, -1.57, 0.0, -1.57, 0.0]
     joint_limit_margin: 0.1
+    # Enforced on internal predicted torques by SolverBoxFDDP. Real DCP3
+    # commands remain joint positions and use the controller's own profiles.
     torque_limits: [431.97, 431.97, 197.23, 79.79, 79.79, 79.79]
-    acceleration_limits: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+    # Diagnostic-only clipping for the internal position-servo test plant.
+    diagnostic_acceleration_clip: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
 
-    # DLS IK is retained only to publish qref and provide a pose-to-joint
-    # diagnostic. The actual MPC includes the SE(3) residual directly.
+    # Optional DLS IK diagnostic; disabled by default to keep target updates fast.
     ik_max_iterations: 150
     ik_damping: 0.001
     ik_step: 0.3
+    diagnostic_ik_enabled: false
 
     # This is also read by the node when it is run directly.  The launch file
     # uses its simulate:= argument for the GUI/simulation process topology.
@@ -60,6 +67,15 @@ crocoddyl_mpc:
     # position limits and the measured-q +/- min(v_max*dt, increment) window.
     command_velocity_limits: [10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
     command_increment_limits: [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+
+    # Horizontal floor in URDF world coordinates, applied to task_frame
+    # (hand_tcp for the minimal Keyboard/Topic Pose GUI). Units: metres.
+    # A 1 mm planning clearance keeps the optimizer off the hard plane.
+    # The final q_cmd filter checks the continuous joint-linear step as well.
+    workspace_floor_enabled: true
+    workspace_min_z: 0.15
+    workspace_floor_margin: 0.001
+    workspace_floor_cost_weight: 1000000.0
 
     # Cartesian line-reference generator.  0.05 m/s is a conservative
     # starting value. Orientation is limited independently in rad/s.
@@ -72,12 +88,21 @@ crocoddyl_mpc:
     cartesian_path_tolerance: 0.005
     cartesian_reference_topic: mpc/cartesian_reference_pose
 
-    # Preview-only simulation stabilizers; they are not hardware parameters.
-    simulation_damping: 5.0
-    simulation_acceleration_smoothing: 0.25
+    # Optional experiment: target-pose velocity as a bounded joint-velocity
+    # reference. Left off by default because the current bounded Cartesian
+    # reference already handles motion and qdot feedforward raised torque in
+    # offline moving-target comparisons.
+    pose_velocity_feedforward_enabled: false
+    pose_velocity_feedforward_gain: 0.5
+    pose_velocity_feedforward_filter_time_constant: 0.08
+    pose_velocity_feedforward_stale_decay: 0.15
+    pose_velocity_feedforward_max_sample_interval: 0.25
+    pose_velocity_feedforward_damping: 0.05
+    pose_velocity_feedforward_max_joint_speed: 0.5
 
-    # One JSONL record per MPC cycle for post-run diagnosis.
+    # Full diagnostic calculations and JSONL records run at this rate.
     diagnostic_logging: true
+    diagnostic_rate: 10.0
     # Empty means ros2_ws/logs/robot_mpc/<UTC run>/.
     diagnostic_log_directory: ""
     diagnostic_flush_period: 1.0

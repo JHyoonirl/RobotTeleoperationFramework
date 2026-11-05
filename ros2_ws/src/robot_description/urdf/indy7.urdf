@@ -188,6 +188,7 @@
     </inertial>
   </link>
   <link name="tcp"/>
+  <link name="hand_tcp"/>
   <joint name="global" type="fixed">
     <origin rpy="0 0 0" xyz="0 0 0"/>
     <parent link="world"/>
@@ -245,6 +246,12 @@
     <parent link="link6"/>
     <child link="tcp"/>
     <origin rpy="0.0                         0.0                         0.0" xyz="0.0                          0.0                          0.06"/>
+  </joint>
+  <!-- Hand frame: offset expressed in the existing tcp coordinates [m, rad]. -->
+  <joint name="hand_tcp_fixed" type="fixed">
+    <parent link="tcp"/>
+    <child link="hand_tcp"/>
+    <origin xyz="-0.1 0 0.08" rpy="0 -3.141592653589793 0"/>
   </joint>
   <ros2_control name="indy" type="system">
     <hardware>

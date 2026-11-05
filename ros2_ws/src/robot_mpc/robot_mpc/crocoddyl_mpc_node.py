@@ -12,7 +12,6 @@ from __future__ import annotations
 import ast
 import json
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -20,17 +19,21 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, Float64MultiArray, String
 
 from .cartesian_path import limit_cartesian_step, project_cartesian_command, segment_error
+from .mpc_diagnostics import MpcDiagnosticsMixin
 from .mpc_cost_config import apply_runtime_cost_settings, load_runtime_cost_settings
 from .se3_dynamic_model import SE3DynamicActionModel
+from .vive_simulation_control import ViveSimulationControl
+from .workspace_floor import limit_height_step
 
 
-class CrocoddylMPCNode(Node):
-    def __init__(self) -> None:
-        super().__init__("robot_crocoddyl_mpc")
+class CrocoddylMPCNode(MpcDiagnosticsMixin, Node):
+    def __init__(self, **kwargs) -> None:
+        super().__init__("robot_crocoddyl_mpc", **kwargs)
         self.declare_parameter("urdf_path", "")
         self.declare_parameter("config_file_path", "")
         self.declare_parameter("control_mode", "task_space")
@@ -52,11 +55,31 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("max_solver_iterations", 10)
         self.declare_parameter("simulate", False)
         self.declare_parameter("initialize_target_from_current_state", False)
+        self.declare_parameter("start_paused", False)
+        self.declare_parameter("enable_vive_follow", False)
+        self.declare_parameter("vive_hand_frame", "hand_tcp")
+        self.declare_parameter("vive_hand_pose_topic", "/robot/vive/hand_target_pose")
+        self.declare_parameter("vive_mapping_status_topic", "/robot/vive_mapping/status")
+        self.declare_parameter("vive_run_service", "/robot/sim/vive_mpc_run")
+        self.declare_parameter("vive_run_status_topic", "/robot/sim/vive_mpc_status")
+        self.declare_parameter("vive_hold_topic", "/robot/sim/vive_mpc_hold")
+        self.declare_parameter("vive_hold_timeout", 0.35)
+        self.declare_parameter("teleop_input_mode", "topic")
+        self.declare_parameter("teleop_mode_service", "/robot/sim/keyboard_mode")
+        self.declare_parameter("keyboard_hand_pose_topic", "/robot/keyboard/hand_target_pose")
+        self.declare_parameter("hand_target_pose_topic", "/robot/hand_target_pose")
+        self.declare_parameter("hand_target_frame", "hand_target")
+        self.declare_parameter("vive_input_timeout", 0.5)
+        self.declare_parameter("joint_state_timeout", 0.5)
         # Keep a deterministic local plant only for standalone smoke tests.
         # Normal simulation uses ros2_control and its joint_states topic.
         self.declare_parameter("internal_simulation", False)
         self.declare_parameter("command_velocity_limits", [1.0] * 6)
         self.declare_parameter("command_increment_limits", [0.02] * 6)
+        self.declare_parameter("workspace_floor_enabled", True)
+        self.declare_parameter("workspace_min_z", 0.10)
+        self.declare_parameter("workspace_floor_margin", 0.001)
+        self.declare_parameter("workspace_floor_cost_weight", 1.0e6)
         # Cartesian reference generator.  The MPC still solves in q/qdot, but
         # each shooting stage receives a point on a bounded-speed SE(3) path.
         self.declare_parameter("cartesian_max_speed", 0.05)
@@ -64,6 +87,15 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("cartesian_speed_margin", 0.5)
         self.declare_parameter("cartesian_min_duration", 0.10)
         self.declare_parameter("cartesian_path_tolerance", 0.005)
+        # Feed desired TCP motion into the joint-velocity part of the MPC cost.
+        # The reference is filtered, Jacobian-mapped and speed-limited.
+        self.declare_parameter("pose_velocity_feedforward_enabled", False)
+        self.declare_parameter("pose_velocity_feedforward_gain", 0.5)
+        self.declare_parameter("pose_velocity_feedforward_filter_time_constant", 0.08)
+        self.declare_parameter("pose_velocity_feedforward_stale_decay", 0.15)
+        self.declare_parameter("pose_velocity_feedforward_max_sample_interval", 0.25)
+        self.declare_parameter("pose_velocity_feedforward_damping", 0.05)
+        self.declare_parameter("pose_velocity_feedforward_max_joint_speed", 0.5)
         self.declare_parameter(
             "cartesian_reference_topic", "mpc/cartesian_reference_pose"
         )
@@ -73,8 +105,6 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter("posture_cost_weight", 0.01)
         self.declare_parameter("velocity_cost_weight", 1.0)
         self.declare_parameter("torque_cost_weight", 0.0001)
-        # Kept for old YAML files; the dynamic model no longer optimizes qddot.
-        self.declare_parameter("acceleration_cost_weight", 0.05)
         self.declare_parameter("joint_limit_cost_weight", 10.0)
         self.declare_parameter("running_cost_weight", 1.0)
         self.declare_parameter("terminal_cost_weight", 10.0)
@@ -82,17 +112,17 @@ class CrocoddylMPCNode(Node):
         self.declare_parameter(
             "torque_limits", [431.97, 431.97, 197.23, 79.79, 79.79, 79.79]
         )
-        self.declare_parameter("acceleration_limits", [20.0] * 6)
+        self.declare_parameter("diagnostic_acceleration_clip", [20.0] * 6)
         self.declare_parameter("ik_max_iterations", 80)
         self.declare_parameter("ik_damping", 0.001)
         self.declare_parameter("ik_step", 0.1)
-        self.declare_parameter("simulation_damping", 5.0)
-        self.declare_parameter("simulation_acceleration_smoothing", 0.25)
+        self.declare_parameter("diagnostic_ik_enabled", False)
         self.declare_parameter("diagnostic_logging", True)
+        self.declare_parameter("diagnostic_rate", 10.0)
         # Empty means <ros2_ws>/logs/robot_mpc, next to src/install/build.
         self.declare_parameter("diagnostic_log_directory", "")
         self.declare_parameter("diagnostic_flush_period", 1.0)
-        self.declare_parameter("diagnostic_log_prediction", True)
+        self.declare_parameter("diagnostic_log_prediction", False)
         self.declare_parameter("stationary_hold_position_tolerance", 2.0e-4)
         self.declare_parameter("stationary_hold_orientation_tolerance", 1.5e-3)
 
@@ -131,7 +161,18 @@ class CrocoddylMPCNode(Node):
         self.control_mode = str(self.get_parameter("control_mode").value).strip().lower()
         if self.control_mode not in {"task_space", "joint"}:
             raise ValueError("control_mode는 task_space 또는 joint여야 합니다.")
-        self.task_frame = str(self.get_parameter("task_frame").value)
+        self.simulate = self._as_bool(self.get_parameter("simulate").value)
+        self.joint_state_timeout = float(self.get_parameter("joint_state_timeout").value)
+        if not np.isfinite(self.joint_state_timeout) or self.joint_state_timeout <= 0.0:
+            raise ValueError("joint_state_timeout must be positive and finite")
+        self.vive_follow_enabled = self.simulate and self._as_bool(
+            self.get_parameter("enable_vive_follow").value
+        )
+        # Vive targets describe the hand itself. Evaluate tracking, Jacobians
+        # and Cartesian path limits at that point, including during rotation.
+        self.task_frame = str(self.get_parameter(
+            "vive_hand_frame" if self.vive_follow_enabled else "task_frame"
+        ).value)
         self.pose_frame = str(self.get_parameter("pose_frame").value)
         self.teleop_pose_topic = str(self.get_parameter("teleop_pose_topic").value).strip()
         self.command_pose_topic = str(self.get_parameter("command_pose_topic").value).strip()
@@ -141,6 +182,18 @@ class CrocoddylMPCNode(Node):
         self.frame_id = self.model.getFrameId(self.task_frame)
         if self.frame_id >= len(self.model.frames):
             raise ValueError(f"URDF frame을 찾을 수 없습니다: {self.task_frame}")
+        self.workspace_floor_enabled = self._as_bool(self.get_parameter("workspace_floor_enabled").value)
+        self.workspace_min_z = float(self.get_parameter("workspace_min_z").value)
+        self.workspace_floor_margin = float(self.get_parameter("workspace_floor_margin").value)
+        self.workspace_floor_cost_weight = float(self.get_parameter("workspace_floor_cost_weight").value)
+        if (not np.isfinite(self.workspace_min_z)
+                or not np.isfinite(self.workspace_floor_margin) or self.workspace_floor_margin <= 0.0
+                or not np.isfinite(self.workspace_floor_cost_weight) or self.workspace_floor_cost_weight <= 0.0):
+            raise ValueError("workspace_min_z must be finite; floor margin/weight must be positive and finite")
+        if self.workspace_floor_enabled and self.pose_frame != "world":
+            raise ValueError("The workspace floor requires pose_frame='world' (the URDF root)")
+        if self.vive_follow_enabled:
+            self.set_parameters([Parameter("task_frame", value=self.task_frame)])
 
         self.goal = self._parse_vector(self.get_parameter("goal").value, 6)
         self.nominal_posture = self._parse_vector(
@@ -174,6 +227,27 @@ class CrocoddylMPCNode(Node):
         self.cartesian_path_tolerance = float(
             self.get_parameter("cartesian_path_tolerance").value
         )
+        self.pose_velocity_feedforward_enabled = self._as_bool(
+            self.get_parameter("pose_velocity_feedforward_enabled").value
+        )
+        self.pose_velocity_feedforward_gain = float(
+            self.get_parameter("pose_velocity_feedforward_gain").value
+        )
+        self.pose_velocity_feedforward_filter_time_constant = float(
+            self.get_parameter("pose_velocity_feedforward_filter_time_constant").value
+        )
+        self.pose_velocity_feedforward_stale_decay = float(
+            self.get_parameter("pose_velocity_feedforward_stale_decay").value
+        )
+        self.pose_velocity_feedforward_max_sample_interval = float(
+            self.get_parameter("pose_velocity_feedforward_max_sample_interval").value
+        )
+        self.pose_velocity_feedforward_damping = float(
+            self.get_parameter("pose_velocity_feedforward_damping").value
+        )
+        self.pose_velocity_feedforward_max_joint_speed = float(
+            self.get_parameter("pose_velocity_feedforward_max_joint_speed").value
+        )
         self.cartesian_reference_topic = str(
             self.get_parameter("cartesian_reference_topic").value
         ).strip()
@@ -192,17 +266,14 @@ class CrocoddylMPCNode(Node):
         self.posture_cost_weight = float(self.get_parameter("posture_cost_weight").value)
         self.velocity_cost_weight = float(self.get_parameter("velocity_cost_weight").value)
         self.torque_cost_weight = float(self.get_parameter("torque_cost_weight").value)
-        self.acceleration_cost_weight = float(
-            self.get_parameter("acceleration_cost_weight").value
-        )
         self.joint_limit_cost_weight = float(
             self.get_parameter("joint_limit_cost_weight").value
         )
         self.running_cost_weight = float(self.get_parameter("running_cost_weight").value)
         self.terminal_cost_weight = float(self.get_parameter("terminal_cost_weight").value)
         self.joint_limit_margin = float(self.get_parameter("joint_limit_margin").value)
-        self.acceleration_limits = self._parse_vector(
-            self.get_parameter("acceleration_limits").value, 6
+        self.diagnostic_acceleration_clip = self._parse_vector(
+            self.get_parameter("diagnostic_acceleration_clip").value, 6
         )
         self.torque_limits = np.minimum(
             self._parse_vector(self.get_parameter("torque_limits").value, 6),
@@ -211,9 +282,8 @@ class CrocoddylMPCNode(Node):
         self.ik_max_iterations = int(self.get_parameter("ik_max_iterations").value)
         self.ik_damping = float(self.get_parameter("ik_damping").value)
         self.ik_step = float(self.get_parameter("ik_step").value)
-        self.simulation_damping = float(self.get_parameter("simulation_damping").value)
-        self.simulation_acceleration_smoothing = float(
-            self.get_parameter("simulation_acceleration_smoothing").value
+        self.diagnostic_ik_enabled = self._as_bool(
+            self.get_parameter("diagnostic_ik_enabled").value
         )
         self.diagnostic_logging = self._as_bool(
             self.get_parameter("diagnostic_logging").value
@@ -224,6 +294,11 @@ class CrocoddylMPCNode(Node):
         self.diagnostic_flush_period = float(
             self.get_parameter("diagnostic_flush_period").value
         )
+        self.diagnostic_rate = float(self.get_parameter("diagnostic_rate").value)
+        if not np.isfinite(self.diagnostic_rate) or self.diagnostic_rate <= 0.0:
+            raise ValueError("diagnostic_rate must be positive and finite")
+        self.diagnostic_period = 1.0 / self.diagnostic_rate
+        self._last_diagnostic_time = -float("inf")
         self.diagnostic_log_prediction = self._as_bool(
             self.get_parameter("diagnostic_log_prediction").value
         )
@@ -233,12 +308,6 @@ class CrocoddylMPCNode(Node):
         self.stationary_hold_orientation_tolerance = float(
             self.get_parameter("stationary_hold_orientation_tolerance").value
         )
-        simulation_value = self.get_parameter("simulate").value
-        self.simulate = (
-            simulation_value
-            if isinstance(simulation_value, bool)
-            else str(simulation_value).strip().lower() in {"1", "true", "yes", "on"}
-        )
         self.internal_simulation = self._as_bool(
             self.get_parameter("internal_simulation").value
         )
@@ -246,6 +315,11 @@ class CrocoddylMPCNode(Node):
             self.get_parameter("initialize_target_from_current_state").value
         )
         self.initial_target_state_initialized = not self.initialize_target_from_current_state
+        self.execution_enabled = not self._as_bool(self.get_parameter("start_paused").value)
+        self._paused_alignment_target = None
+        self._paused_alignment_deadline = 0.0
+        self.vive_control = None
+        self._last_paused_publish = -float("inf")
         cost_weights = (
             self.se3_position_cost_weight,
             self.se3_orientation_cost_weight,
@@ -284,8 +358,24 @@ class CrocoddylMPCNode(Node):
             raise ValueError("cost weight는 모두 양수인 유한값이어야 합니다.")
         if not np.isfinite(self.cartesian_path_tolerance) or self.cartesian_path_tolerance <= 0.0:
             raise ValueError("cartesian_path_tolerance은 양수인 유한값이어야 합니다 [m].")
+        feedforward_settings = (
+            self.pose_velocity_feedforward_gain,
+            self.pose_velocity_feedforward_filter_time_constant,
+            self.pose_velocity_feedforward_stale_decay,
+            self.pose_velocity_feedforward_max_sample_interval,
+            self.pose_velocity_feedforward_damping,
+            self.pose_velocity_feedforward_max_joint_speed,
+        )
+        if (
+            not np.all(np.isfinite(feedforward_settings))
+            or not 0.0 <= self.pose_velocity_feedforward_gain <= 1.0
+            or any(value <= 0.0 for value in feedforward_settings[1:])
+        ):
+            raise ValueError(
+                "Pose velocity feedforward gain은 [0, 1], 나머지 설정은 양수인 유한값이어야 합니다."
+            )
         # The continuous command-step bound assumes bounded revolute joints.
-        if self.control_mode == "task_space" and any(
+        if (self.control_mode == "task_space" or self.workspace_floor_enabled) and any(
             not joint.shortname().startswith("JointModelR") or joint.nq != 1 or joint.nv != 1
             for joint in list(self.model.joints)[1:]
         ):
@@ -294,10 +384,6 @@ class CrocoddylMPCNode(Node):
             float(np.linalg.norm(placement.translation))
             for placement in self.model.jointPlacements
         ) + float(np.linalg.norm(self.model.frames[self.frame_id].placement.translation))
-        if self.simulation_damping < 0.0 or not np.isfinite(self.simulation_damping):
-            raise ValueError("simulation_damping은 0 이상인 유한값이어야 합니다.")
-        if not 0.0 < self.simulation_acceleration_smoothing <= 1.0:
-            raise ValueError("simulation_acceleration_smoothing은 (0, 1] 범위여야 합니다.")
         if self.diagnostic_flush_period <= 0.0 or not np.isfinite(self.diagnostic_flush_period):
             raise ValueError("diagnostic_flush_period는 양수인 유한값이어야 합니다.")
         if (
@@ -336,12 +422,17 @@ class CrocoddylMPCNode(Node):
         self.cartesian_path_deviation = 0.0
         self.cartesian_command_scale = 1.0
         self.cartesian_path_guard = ""
+        self.workspace_floor_guard = ""
         self.cartesian_path_initialized_from_state = False
         self.cartesian_reference_poses = [
-            self.target_pose.copy() for _ in range(self.horizon + 1)
+            self._optimization_target_pose() for _ in range(self.horizon + 1)
         ]
         if self.control_mode == "task_space":
-            self.xref = np.r_[self._solve_ik(self.target_pose, self.sim_q), np.zeros(self.model.nv)]
+            initial_qref = (
+                self._solve_ik(self._optimization_target_pose(), self.sim_q)
+                if self.diagnostic_ik_enabled else self.sim_q.copy()
+            )
+            self.xref = np.r_[initial_qref, np.zeros(self.model.nv)]
         else:
             self.xref = np.r_[self.goal, np.zeros(self.model.nv)]
         self.problem, self.solver = self._make_problem()
@@ -357,6 +448,8 @@ class CrocoddylMPCNode(Node):
         self.last_target_acceleration = np.zeros(self.model.nv)
         self.last_applied_acceleration = np.zeros(self.model.nv)
         self.last_dynamics: dict = {}
+        self.last_cost_terms: dict = {}
+        self.last_terminal_cost_terms: dict = {}
         self.last_q_cmd: np.ndarray | None = None
         self.stationary_hold_active = False
         self.stationary_hold_target_count = -1
@@ -366,6 +459,12 @@ class CrocoddylMPCNode(Node):
         # Both ros2_control simulation and the real driver expose joint_states.
         # A solve can exceed dt; queued feedback would make the controller chase old states.
         self.create_subscription(JointState, "joint_states", self._on_joint_state, 1)
+        self.create_subscription(
+            JointState,
+            "/robot/sim/sync_joint_target",
+            self._on_sim_sync_joint_target,
+            10,
+        )
         self.state_pub = (
             self.create_publisher(JointState, "joint_states", 10)
             if self.internal_simulation
@@ -388,15 +487,20 @@ class CrocoddylMPCNode(Node):
         self.position_error_pub = self.create_publisher(Float64, "mpc/position_error", 10)
         self.orientation_error_pub = self.create_publisher(Float64, "mpc/orientation_error", 10)
         self.solve_time_pub = self.create_publisher(Float64, "mpc/solve_time_ms", 10)
+        self.callback_time_pub = self.create_publisher(Float64, "mpc/callback_time_ms", 10)
         self.solve_iterations_pub = self.create_publisher(Float64, "mpc/solver_iterations", 10)
         self.solve_success_pub = self.create_publisher(Float64, "mpc/solver_success", 10)
         self.status_pub = self.create_publisher(String, "mpc/status", 10)
+        self.sim_sync_ack_pub = self.create_publisher(
+            String, "/robot/sim/sync_joint_target/status", 10
+        )
         self.control_norm_pub = self.create_publisher(Float64, "mpc/control_norm", 10)
         self.cost_term_pubs = {
             name: self.create_publisher(Float64, f"mpc/cost/{name}", 10)
             for name in (
                 "se3_tracking",
                 "cartesian_path",
+                "workspace_floor",
                 "posture",
                 "velocity",
                 "torque",
@@ -411,7 +515,15 @@ class CrocoddylMPCNode(Node):
         self.previous_target_pose = self.target_pose.copy()
         self.last_target_update_dt = float("nan")
         self.last_target_delta_rotation_world = np.zeros(3)
+        self.last_target_linear_velocity_world = np.zeros(3)
         self.last_target_angular_velocity_world = np.zeros(3)
+        self.filtered_target_linear_velocity_world = np.zeros(3)
+        self.filtered_target_angular_velocity_world = np.zeros(3)
+        self._feedforward_previous_target_pose = self.target_pose.copy()
+        self._feedforward_previous_update_monotonic = time.monotonic()
+        self.last_pose_velocity_feedforward = np.zeros(self.model.nv)
+        if self.vive_follow_enabled:
+            self.vive_control = ViveSimulationControl(self)
         self._diagnostic_start_monotonic = time.monotonic()
         self._open_diagnostic_log(urdf_path)
         self.create_timer(self.dt, self._solve_once)
@@ -451,331 +563,6 @@ class CrocoddylMPCNode(Node):
             return value
         return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
-    def _open_diagnostic_log(self, urdf_path: Path) -> None:
-        """Create one self-contained JSONL trace and a parameter snapshot."""
-        if not self.diagnostic_logging:
-            return
-        try:
-            requested = self.diagnostic_log_directory.strip()
-            if requested:
-                root = Path(requested).expanduser()
-            else:
-                workspace = next(
-                    (
-                        parent
-                        for parent in (urdf_path.parent, *urdf_path.parents)
-                        if (parent / "src").is_dir() and (parent / "install").is_dir()
-                    ),
-                    Path.cwd(),
-                )
-                root = workspace / "logs" / "robot_mpc"
-            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            run_dir = root / stamp
-            run_dir.mkdir(parents=True, exist_ok=False)
-            self._diagnostic_path = run_dir / "trace.jsonl"
-            self._diagnostic_file = self._diagnostic_path.open(
-                "w", encoding="utf-8", buffering=8192
-            )
-            parameter_names = (
-                "urdf_path",
-                "control_mode",
-                "task_frame",
-                "pose_frame",
-                "teleop_pose_topic",
-                "command_pose_topic",
-                "joint_command_topic",
-                "goal",
-                "nominal_posture",
-                "goal_position",
-                "goal_orientation_xyzw",
-                "horizon",
-                "dt",
-                "max_solver_iterations",
-                "simulate",
-                "initialize_target_from_current_state",
-                "internal_simulation",
-                "command_velocity_limits",
-                "command_increment_limits",
-                "cartesian_max_speed",
-                "cartesian_max_angular_speed",
-                "cartesian_speed_margin",
-                "cartesian_min_duration",
-                "cartesian_path_tolerance",
-                "cartesian_reference_topic",
-                "se3_position_cost_weight",
-                "se3_orientation_cost_weight",
-                "posture_cost_weight",
-                "velocity_cost_weight",
-                "torque_cost_weight",
-                "acceleration_cost_weight",
-                "joint_limit_cost_weight",
-                "running_cost_weight",
-                "terminal_cost_weight",
-                "joint_limit_margin",
-                "torque_limits",
-                "acceleration_limits",
-                "ik_max_iterations",
-                "ik_damping",
-                "ik_step",
-                "simulation_damping",
-                "simulation_acceleration_smoothing",
-                "diagnostic_logging",
-                "diagnostic_log_directory",
-                "diagnostic_flush_period",
-                "diagnostic_log_prediction",
-                "stationary_hold_position_tolerance",
-                "stationary_hold_orientation_tolerance",
-            )
-            parameters = {
-                name: self.get_parameter(name).value for name in parameter_names
-            }
-            parameters["urdf_path"] = str(urdf_path)
-            parameters["resolved_log_directory"] = str(root)
-            parameters["effective_torque_limits"] = self.torque_limits
-            parameters["urdf_effort_limits"] = np.asarray(self.model.effortLimit, dtype=float)
-            (run_dir / "parameters.json").write_text(
-                json.dumps(self._json_safe(parameters), indent=2, ensure_ascii=False)
-                + "\n",
-                encoding="utf-8",
-            )
-            self.get_logger().info(f"MPC diagnostic log: {self._diagnostic_path}")
-        except (OSError, TypeError, ValueError) as exc:
-            if self._diagnostic_file is not None:
-                self._diagnostic_file.close()
-            self.diagnostic_logging = False
-            self._diagnostic_file = None
-            self._diagnostic_path = None
-            self.get_logger().error(f"진단 로그를 열 수 없습니다: {exc}")
-
-    @staticmethod
-    def _json_safe(value):
-        if isinstance(value, np.ndarray):
-            return CrocoddylMPCNode._json_safe(value.tolist())
-        if isinstance(value, (np.floating, np.integer, np.bool_)):
-            value = value.item()
-        if isinstance(value, float):
-            return value if np.isfinite(value) else None
-        if isinstance(value, dict):
-            return {str(key): CrocoddylMPCNode._json_safe(item) for key, item in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [CrocoddylMPCNode._json_safe(item) for item in value]
-        return value
-
-    def _pose_record(self, pose) -> dict[str, list[float]]:
-        quaternion = self.pin.Quaternion(pose.rotation).coeffs()
-        return {
-            "position": [float(value) for value in pose.translation],
-            "orientation_xyzw": [float(value) for value in quaternion],
-        }
-
-    def _joint_limit_record(self, q: np.ndarray) -> dict[str, list[float]]:
-        lower = np.asarray(self.model.lowerPositionLimit, dtype=float)
-        upper = np.asarray(self.model.upperPositionLimit, dtype=float)
-        soft_lower = lower + self.joint_limit_margin
-        soft_upper = upper - self.joint_limit_margin
-        q = np.asarray(q, dtype=float)
-        return {
-            "lower": lower,
-            "upper": upper,
-            "hard_margin": np.minimum(q - lower, upper - q),
-            "soft_margin": np.minimum(q - soft_lower, soft_upper - q),
-            "soft_violation": np.maximum(soft_lower - q, 0.0)
-            + np.maximum(q - soft_upper, 0.0),
-        }
-
-    def _jacobian_record(self, q: np.ndarray, pose) -> dict[str, object]:
-        self.pin.computeJointJacobians(self.model, self.pose_data, q)
-        self.pin.updateFramePlacements(self.model, self.pose_data)
-        jacobian = np.asarray(
-            self.pin.getFrameJacobian(
-                self.model, self.pose_data, self.frame_id, self.pin.LOCAL
-            ),
-            dtype=float,
-        ).copy()
-        singular_values = np.linalg.svd(jacobian, compute_uv=False)
-        sigma_min = float(singular_values[-1])
-        condition = (
-            float(singular_values[0] / sigma_min)
-            if sigma_min > 1.0e-12
-            else float("inf")
-        )
-        world_z_local = np.asarray(pose.rotation.T @ np.array([0.0, 0.0, 1.0]))
-        world_z_twist = np.r_[np.zeros(3), world_z_local]
-        world_z_qdot = np.linalg.pinv(jacobian) @ world_z_twist
-        return {
-            "local": jacobian,
-            "singular_values": singular_values,
-            "sigma_min": sigma_min,
-            "condition_number": condition,
-            "world_z_axis_in_tcp": world_z_local,
-            "unit_world_z_yaw_qdot": world_z_qdot,
-            "unit_world_z_yaw_qdot_norm": float(np.linalg.norm(world_z_qdot)),
-        }
-
-    def _write_diagnostic(
-        self,
-        *,
-        status: str,
-        state: np.ndarray,
-        target,
-        solve_time_ms: float = float("nan"),
-        solver_success: bool = False,
-        solver_iterations: int = 0,
-        solver_cost: float = float("nan"),
-        solver_error: str = "",
-        stationary_optimum: bool = False,
-        prediction_guard: str = "",
-        raw_control: np.ndarray | None = None,
-        q_cmd: np.ndarray | None = None,
-        predicted_next_state: np.ndarray | None = None,
-        applied_state: np.ndarray | None = None,
-        cost_terms: dict | None = None,
-        terminal_cost_terms: dict | None = None,
-        current_pose=None,
-        pose_error: np.ndarray | None = None,
-        jacobian: dict | None = None,
-        dynamics: dict | None = None,
-    ) -> None:
-        if self._diagnostic_file is None:
-            return
-        try:
-            state = np.asarray(state, dtype=float)
-            q = state[: self.model.nq]
-            velocity = state[self.model.nq : self.model.nq + self.model.nv]
-            if current_pose is None:
-                current_pose = self._tcp_pose(q).copy()
-            if pose_error is None:
-                pose_error = self._pose_error(q, target, self.pose_data)
-            if jacobian is None:
-                jacobian = self._jacobian_record(q, current_pose)
-            if raw_control is None:
-                raw_control = np.full(self.model.nv, np.nan)
-            if q_cmd is None:
-                q_cmd = np.full(self.model.nq, np.nan)
-            if cost_terms is None:
-                cost_terms = {}
-            if terminal_cost_terms is None:
-                terminal_cost_terms = {}
-            if dynamics is None:
-                dynamics = {}
-            qref = np.asarray(self.xref[: self.model.nq], dtype=float)
-            angular_distance = float(
-                np.linalg.norm(
-                    self.pin.log3(
-                        self.cartesian_path_start_pose.rotation.T
-                        @ self.target_pose.rotation
-                    )
-                )
-            )
-            record = {
-                "schema_version": 3,
-                "elapsed_s": time.monotonic() - self._diagnostic_start_monotonic,
-                "ros_time_s": self.get_clock().now().nanoseconds * 1.0e-9,
-                "cycle": self.solve_count,
-                "status": status,
-                "state": {
-                    "q": q,
-                    "velocity": velocity,
-                    "tcp_pose": self._pose_record(current_pose),
-                },
-                "state_input": {
-                    "age_s": time.monotonic() - self.last_state_update_monotonic
-                    if np.isfinite(self.last_state_update_monotonic)
-                    else float("nan"),
-                    "message_stamp_s": self.last_state_stamp_s,
-                    "message_age_s": self.get_clock().now().nanoseconds * 1.0e-9
-                    - self.last_state_stamp_s
-                    if np.isfinite(self.last_state_stamp_s)
-                    else float("nan"),
-                },
-                "target_pose": self._pose_record(target),
-                "target_input": {
-                    "update_count": self.target_update_count,
-                    "age_s": time.monotonic() - self.last_target_update_monotonic
-                    if np.isfinite(self.last_target_update_monotonic)
-                    else float("nan"),
-                    "message_stamp_s": self.last_target_stamp_s,
-                    "update_dt_s": self.last_target_update_dt,
-                    "delta_rotation_world_rad": self.last_target_delta_rotation_world,
-                    "angular_velocity_world_rad_s": self.last_target_angular_velocity_world,
-                },
-                "cartesian_path": {
-                    "start_pose": self._pose_record(self.cartesian_path_start_pose),
-                    "goal_pose": self._pose_record(self.target_pose),
-                    "reference_pose": self._pose_record(self.cartesian_reference_poses[0]),
-                    "reference_horizon": [
-                        self._pose_record(reference)
-                        for reference in self.cartesian_reference_poses
-                    ],
-                    "speed_limit_m_s": self.cartesian_path_speed,
-                    "angular_speed_limit_rad_s": self.cartesian_max_angular_speed,
-                    "angular_distance_rad": angular_distance,
-                    "duration_s": self.cartesian_path_duration,
-                    "progress": self.cartesian_path_progress,
-                    "deviation_m": self.cartesian_path_deviation,
-                    "tolerance_m": self.cartesian_path_tolerance,
-                    "command_scale": self.cartesian_command_scale,
-                    "guard": self.cartesian_path_guard,
-                },
-                "pose_error_local": pose_error,
-                "position_error_world": np.asarray(target.translation - current_pose.translation),
-                "orientation_error_world": np.asarray(current_pose.rotation @ pose_error[3:]),
-                "position_error_norm_m": float(np.linalg.norm(pose_error[:3])),
-                "orientation_error_norm_rad": float(np.linalg.norm(pose_error[3:])),
-                "qref": qref,
-                "q_cmd": q_cmd,
-                "q_minus_qref": q - qref,
-                "joint_limits": self._joint_limit_record(q),
-                "solver": {
-                    "success": bool(solver_success),
-                    "iterations": int(solver_iterations),
-                    "solve_time_ms": float(solve_time_ms),
-                    "cost": float(solver_cost),
-                    "error": solver_error,
-                    "stop": getattr(self.solver, "stop", ""),
-                    "th_stop": getattr(self.solver, "th_stop", float("nan")),
-                    "th_grad": getattr(self.solver, "th_grad", float("nan")),
-                    "dV": getattr(self.solver, "dV", []),
-                    "state_regularization": getattr(self.solver, "preg", float("nan")),
-                    "regularization_delta": getattr(self.solver, "dreg", float("nan")),
-                    "stationary_optimum": bool(stationary_optimum),
-                    "prediction_guard": prediction_guard,
-                },
-                "control": {
-                    "raw_torque": raw_control,
-                    # Legacy name retained so old analysis scripts still load.
-                    "raw_qddot": raw_control,
-                    "raw_norm": float(np.linalg.norm(raw_control))
-                    if np.all(np.isfinite(raw_control))
-                    else float("nan"),
-                    "command_boundary": "joint_position",
-                    "applied_torque": None,
-                    "target_qddot_after_clip": self.last_target_acceleration,
-                    "applied_qddot": self.last_applied_acceleration,
-                    "applied_norm": float(np.linalg.norm(self.last_applied_acceleration)),
-                },
-                "cost_terms": cost_terms,
-                "terminal_cost_terms": terminal_cost_terms,
-                "dynamics": dynamics,
-                "jacobian": jacobian,
-                "predicted_next_state": predicted_next_state,
-                "applied_state": applied_state,
-            }
-            if self.diagnostic_log_prediction:
-                record["prediction"] = {
-                    "xs": [np.asarray(item, dtype=float) for item in self.xs],
-                    "us": [np.asarray(item, dtype=float) for item in self.us],
-                }
-            self._diagnostic_file.write(
-                json.dumps(self._json_safe(record), separators=(",", ":")) + "\n"
-            )
-            if time.monotonic() - self._diagnostic_last_flush >= self.diagnostic_flush_period:
-                self._diagnostic_file.flush()
-                self._diagnostic_last_flush = time.monotonic()
-        except (OSError, TypeError, ValueError, RuntimeError) as exc:
-            self.get_logger().error(f"진단 로그 기록 실패: {exc}")
-            self._diagnostic_file.close()
-            self._diagnostic_file = None
 
     @staticmethod
     def _parse_quaternion(value: object) -> np.ndarray:
@@ -865,6 +652,9 @@ class CrocoddylMPCNode(Node):
                 torque_limits=self.torque_limits,
                 path_tolerance=self.cartesian_path_tolerance
                 if self.control_mode == "task_space" else None,
+                minimum_z=self.workspace_min_z if self.workspace_floor_enabled else None,
+                floor_margin=self.workspace_floor_margin,
+                floor_weight=self.workspace_floor_cost_weight,
             )
             self.running_actions.append(action)
             running_models.append(c.IntegratedActionModelEuler(action, self.dt))
@@ -875,7 +665,7 @@ class CrocoddylMPCNode(Node):
             model=self.model,
             state=self.state,
             frame_id=self.frame_id,
-            target=self.target_pose,
+            target=self._optimization_target_pose(),
             nominal_posture=nominal_posture,
             weights=task_weights,
             terminal_scale=self.terminal_cost_weight,
@@ -883,12 +673,17 @@ class CrocoddylMPCNode(Node):
             torque_limits=self.torque_limits,
             path_tolerance=self.cartesian_path_tolerance
             if self.control_mode == "task_space" else None,
+            minimum_z=self.workspace_min_z if self.workspace_floor_enabled else None,
+            floor_margin=self.workspace_floor_margin,
+            floor_weight=self.workspace_floor_cost_weight,
             terminal=True,
         )
         terminal_model = c.IntegratedActionModelEuler(self.terminal_action, 0.0)
         x0 = self.xref.copy()
         problem = c.ShootingProblem(x0, running_models, terminal_model)
-        return problem, c.SolverFDDP(problem)
+        # FDDP ignores control bounds. The action model's effort limits are
+        # enforced only by the box-constrained solver.
+        return problem, c.SolverBoxFDDP(problem)
 
     def _reload_cost_config_if_changed(self) -> None:
         """Apply edited cost settings without restarting the active MPC solver."""
@@ -979,7 +774,7 @@ class CrocoddylMPCNode(Node):
         """Interpolate position linearly and orientation on SO(3)."""
         alpha = float(np.clip(alpha, 0.0, 1.0))
         start = self.cartesian_path_start_pose
-        goal = self.target_pose
+        goal = self._optimization_target_pose()
         position = (1.0 - alpha) * start.translation + alpha * goal.translation
         rotation_delta = self.pin.log3(start.rotation.T @ goal.rotation)
         rotation = start.rotation @ self.pin.exp3(alpha * rotation_delta)
@@ -989,17 +784,18 @@ class CrocoddylMPCNode(Node):
         """Refresh every Crocoddyl stage with a bounded-speed Cartesian line."""
         if self.control_mode != "task_space":
             self.cartesian_reference_poses = [
-                self.target_pose.copy() for _ in range(self.horizon + 1)
+                self._optimization_target_pose() for _ in range(self.horizon + 1)
             ]
             self.cartesian_path_speed = 0.0
             self.cartesian_path_progress = 1.0
             self.cartesian_path_deviation = 0.0
         else:
-            displacement = self.target_pose.translation - self.cartesian_path_start_pose.translation
+            goal_pose = self._optimization_target_pose()
+            displacement = goal_pose.translation - self.cartesian_path_start_pose.translation
             self.cartesian_path_speed = self._cartesian_speed_limit(q, displacement)
             distance = float(np.linalg.norm(displacement))
             rotation_delta = self.pin.log3(
-                self.cartesian_path_start_pose.rotation.T @ self.target_pose.rotation
+                self.cartesian_path_start_pose.rotation.T @ goal_pose.rotation
             )
             rotation_angle = float(np.linalg.norm(rotation_delta))
             self.cartesian_path_duration = max(
@@ -1021,23 +817,162 @@ class CrocoddylMPCNode(Node):
                 np.linalg.norm(segment_error(
                     current_pose.translation,
                     self.cartesian_path_start_pose.translation,
-                    self.target_pose.translation,
+                    goal_pose.translation,
                 )[0])
             )
 
+        velocity_reference = self._joint_velocity_feedforward(q)
         for action, reference_pose in zip(
             self.running_actions, self.cartesian_reference_poses[:-1]
         ):
             action.update_target(reference_pose)
             action.update_path(
-                self.cartesian_path_start_pose.translation, self.target_pose.translation
+                self.cartesian_path_start_pose.translation,
+                self._optimization_target_pose().translation,
             )
+            action.update_velocity_reference(velocity_reference)
         self.terminal_action.update_target(self.cartesian_reference_poses[-1])
         self.terminal_action.update_path(
-            self.cartesian_path_start_pose.translation, self.target_pose.translation
+            self.cartesian_path_start_pose.translation,
+            self._optimization_target_pose().translation,
         )
+        self.terminal_action.update_velocity_reference(velocity_reference)
+
+    def _reset_pose_velocity_estimate(self, target_pose, now=None) -> None:
+        """Prevent a synchronization or mode transition from becoming motion feedforward."""
+        now = time.monotonic() if now is None else float(now)
+        self._feedforward_previous_target_pose = target_pose.copy()
+        self._feedforward_previous_update_monotonic = now
+        self.filtered_target_linear_velocity_world = np.zeros(3)
+        self.filtered_target_angular_velocity_world = np.zeros(3)
+        self.last_target_linear_velocity_world = np.zeros(3)
+        self.last_target_angular_velocity_world = np.zeros(3)
+        self.last_target_delta_rotation_world = np.zeros(3)
+        self.last_target_update_dt = float("nan")
+        self.last_pose_velocity_feedforward = np.zeros(self.model.nv)
+
+    @staticmethod
+    def _limit_vector_norm(vector: np.ndarray, maximum: float) -> np.ndarray:
+        vector = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(vector))
+        if not np.isfinite(norm):
+            return np.zeros_like(vector)
+        return vector * (maximum / norm) if norm > maximum else vector
+
+    def _update_pose_velocity_estimate(self, target_pose, now: float) -> None:
+        """Estimate and filter world-frame linear/angular target velocity."""
+        previous = self._feedforward_previous_target_pose
+        previous_time = self._feedforward_previous_update_monotonic
+        sample_dt = float(now - previous_time)
+        linear_velocity = np.zeros(3)
+        angular_velocity = np.zeros(3)
+        delta_rotation_world = np.zeros(3)
+        valid_sample = (
+            np.isfinite(sample_dt)
+            and 1.0e-4 < sample_dt <= self.pose_velocity_feedforward_max_sample_interval
+        )
+        if valid_sample:
+            linear_velocity = (
+                target_pose.translation - previous.translation
+            ) / sample_dt
+            delta_rotation_local = self.pin.log3(
+                previous.rotation.T @ target_pose.rotation
+            )
+            delta_rotation_world = previous.rotation @ delta_rotation_local
+            angular_velocity = delta_rotation_world / sample_dt
+            linear_velocity = self._limit_vector_norm(
+                linear_velocity, self.cartesian_max_speed
+            )
+            angular_velocity = self._limit_vector_norm(
+                angular_velocity, self.cartesian_max_angular_speed
+            )
+            # Ignore tracker noise below a small speed deadband.
+            if np.linalg.norm(linear_velocity) < 0.001:
+                linear_velocity.fill(0.0)
+            if np.linalg.norm(angular_velocity) < 0.005:
+                angular_velocity.fill(0.0)
+            alpha = 1.0 - np.exp(
+                -sample_dt / self.pose_velocity_feedforward_filter_time_constant
+            )
+            self.filtered_target_linear_velocity_world = (
+                (1.0 - alpha) * self.filtered_target_linear_velocity_world
+                + alpha * linear_velocity
+            )
+            self.filtered_target_angular_velocity_world = (
+                (1.0 - alpha) * self.filtered_target_angular_velocity_world
+                + alpha * angular_velocity
+            )
+        else:
+            # A long gap makes a finite difference misleading; restart from rest.
+            self.filtered_target_linear_velocity_world.fill(0.0)
+            self.filtered_target_angular_velocity_world.fill(0.0)
+
+        self.last_target_update_dt = sample_dt
+        self.last_target_delta_rotation_world = delta_rotation_world
+        self.last_target_linear_velocity_world = linear_velocity
+        self.last_target_angular_velocity_world = angular_velocity
+        self._feedforward_previous_target_pose = target_pose.copy()
+        self._feedforward_previous_update_monotonic = now
+
+    def _joint_velocity_feedforward(self, q: np.ndarray) -> np.ndarray:
+        """Map filtered TCP twist to a bounded joint-velocity cost reference."""
+        result = np.zeros(self.model.nv)
+        if (
+            self.control_mode != "task_space"
+            or not self.pose_velocity_feedforward_enabled
+            or self.pose_velocity_feedforward_gain <= 0.0
+        ):
+            self.last_pose_velocity_feedforward = result
+            return result
+
+        age = time.monotonic() - self._feedforward_previous_update_monotonic
+        if not np.isfinite(age) or age < 0.0:
+            self.last_pose_velocity_feedforward = result
+            return result
+        stale_scale = np.exp(-age / self.pose_velocity_feedforward_stale_decay)
+        twist = self.pose_velocity_feedforward_gain * stale_scale * np.r_[
+            self.filtered_target_linear_velocity_world,
+            self.filtered_target_angular_velocity_world,
+        ]
+        if not np.all(np.isfinite(twist)) or np.linalg.norm(twist) < 1.0e-10:
+            self.last_pose_velocity_feedforward = result
+            return result
+
+        try:
+            self.pin.computeJointJacobians(self.model, self.pose_data, q)
+            self.pin.updateFramePlacements(self.model, self.pose_data)
+            jacobian = self.pin.getFrameJacobian(
+                self.model, self.pose_data, self.frame_id, self.pin.LOCAL_WORLD_ALIGNED
+            )
+            damping_squared = self.pose_velocity_feedforward_damping**2
+            result = jacobian.T @ np.linalg.solve(
+                jacobian @ jacobian.T + damping_squared * np.eye(6), twist
+            )
+        except (ValueError, np.linalg.LinAlgError, RuntimeError):
+            result = np.zeros(self.model.nv)
+        if not np.all(np.isfinite(result)):
+            result = np.zeros(self.model.nv)
+        per_joint_limits = np.minimum(
+            self.command_velocity_limits, np.asarray(self.model.velocityLimit, dtype=float)
+        )
+        maximum_ratio = float(np.max(np.abs(result) / np.maximum(per_joint_limits, 1.0e-12)))
+        maximum_component = float(np.max(np.abs(result))) if result.size else 0.0
+        scale = min(
+            1.0,
+            1.0 / maximum_ratio if maximum_ratio > 1.0 else 1.0,
+            self.pose_velocity_feedforward_max_joint_speed / maximum_component
+            if maximum_component > self.pose_velocity_feedforward_max_joint_speed else 1.0,
+        )
+        result *= scale
+        self.last_pose_velocity_feedforward = result.copy()
+        return result
 
     def _on_target_pose(self, message: PoseStamped) -> None:
+        if self.vive_control is not None and self.vive_control.following:
+            return
+        self._apply_target_pose(message)
+
+    def _apply_target_pose(self, message: PoseStamped) -> None:
         if message.header.frame_id and message.header.frame_id != self.pose_frame:
             self.get_logger().warn(
                 f"teleop pose frame '{message.header.frame_id}'를 '{self.pose_frame}'로 변환할 TF가 없습니다. 무시합니다.",
@@ -1075,10 +1010,11 @@ class CrocoddylMPCNode(Node):
         ):
             seed = self.latest_state[: self.model.nq] if self.latest_state is not None else self.sim_q
             current_pose = self._tcp_pose(seed).copy()
+            mpc_target = self._optimization_target_pose(new_target)
             new_deviation = np.linalg.norm(segment_error(
                 current_pose.translation,
                 self.cartesian_path_start_pose.translation,
-                new_target.translation,
+                mpc_target.translation,
             )[0])
             if (
                 update_now - self.cartesian_path_start_time >= self.cartesian_path_duration
@@ -1086,18 +1022,7 @@ class CrocoddylMPCNode(Node):
             ):
                 self.cartesian_path_start_pose = current_pose
                 self.cartesian_path_start_time = update_now
-        target_dt = update_now - self.last_target_update_monotonic
-        if self.previous_target_pose is not None and target_dt > 0.0:
-            delta_local = self.pin.log3(
-                self.previous_target_pose.rotation.T @ new_target.rotation
-            )
-            self.last_target_delta_rotation_world = (
-                self.previous_target_pose.rotation @ delta_local
-            )
-            self.last_target_update_dt = target_dt
-            self.last_target_angular_velocity_world = (
-                self.last_target_delta_rotation_world / target_dt
-            )
+        self._update_pose_velocity_estimate(new_target, update_now)
         self.target_pose = new_target
         self.previous_target_pose = new_target.copy()
         self.target_update_count += 1
@@ -1108,7 +1033,26 @@ class CrocoddylMPCNode(Node):
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
         seed = self.latest_state[:6] if self.latest_state is not None else self.sim_q
-        self.xref = np.r_[self._solve_ik(self.target_pose, seed), np.zeros(self.model.nv)]
+        qref = (
+            self._solve_ik(self._optimization_target_pose(), seed)
+            if self.diagnostic_ik_enabled else seed.copy()
+        )
+        self.xref = np.r_[qref, np.zeros(self.model.nv)]
+
+    def _optimization_target_pose(self, desired=None):
+        """Project an infeasible desired goal for MPC while preserving its input pose."""
+        target = (self.target_pose if desired is None else desired).copy()
+        if self.workspace_floor_enabled:
+            target.translation[2] = max(
+                target.translation[2], self.workspace_min_z + self.workspace_floor_margin
+            )
+        return target
+
+    def _below_workspace_floor(self, q):
+        return self.workspace_floor_enabled and float(self._tcp_pose(q).translation[2]) < self.workspace_min_z
+
+    def _command_guard(self):
+        return self.workspace_floor_guard or self.cartesian_path_guard
 
     def _tcp_pose(self, q: np.ndarray):
         self.pin.framesForwardKinematics(self.model, self.pose_data, q)
@@ -1164,7 +1108,11 @@ class CrocoddylMPCNode(Node):
             float(message.header.stamp.sec)
             + float(message.header.stamp.nanosec) * 1.0e-9
         )
-        if self.simulate and not self.internal_simulation and self.latest_state is not None:
+        if self.simulate and not self.internal_simulation and not self.execution_enabled:
+            # A paused alignment teleports the mock plant. That reset must not
+            # become a large finite-difference velocity at the next F7 start.
+            velocity = np.zeros(self.model.nv)
+        elif self.simulate and not self.internal_simulation and self.latest_state is not None:
             elapsed = state_stamp_s - self.last_state_stamp_s
             if elapsed > 1.0e-6:
                 # Average the mock servo's position jumps across the samples we actually consume.
@@ -1181,6 +1129,7 @@ class CrocoddylMPCNode(Node):
             current_pose = self._tcp_pose(position).copy()
             self.target_pose = current_pose
             self.previous_target_pose = current_pose.copy()
+            self._reset_pose_velocity_estimate(current_pose)
             self.cartesian_path_start_pose = current_pose.copy()
             self.cartesian_path_start_time = time.monotonic()
             self.cartesian_path_duration = self.cartesian_min_duration
@@ -1196,6 +1145,93 @@ class CrocoddylMPCNode(Node):
             self.get_logger().info(
                 "Initial task target set to measured robot TCP pose; waiting for teleop input."
             )
+
+    def _on_sim_sync_joint_target(self, message: JointState) -> None:
+        """Set the simulated Desired pose from a named, mapped robot posture."""
+        request_id = message.header.frame_id
+
+        def acknowledge(success: bool, detail: str) -> None:
+            self.sim_sync_ack_pub.publish(
+                String(
+                    data=json.dumps(
+                        {"request_id": request_id, "success": success, "message": detail}
+                    )
+                )
+            )
+
+        if not self.simulate:
+            acknowledge(False, "MPC is not in simulation mode.")
+            return
+        if self.vive_control is not None and self.vive_control.following:
+            acknowledge(False, "Pause Vive following before syncing a robot joint pose.")
+            return
+        if self.control_mode != "task_space":
+            acknowledge(False, "Desired pose sync is available only in task_space control mode.")
+            return
+        if self.latest_state is None or time.monotonic() - self.last_state_update_monotonic > 0.5:
+            acknowledge(False, "Simulation joint state is unavailable or stale.")
+            return
+        if message.name != self.joint_names or len(message.position) != self.model.nq:
+            acknowledge(False, "The sync request has invalid joint names or an incorrect joint count.")
+            return
+        target_q = np.asarray(message.position, dtype=float)
+        if not np.all(np.isfinite(target_q)):
+            acknowledge(False, "The sync request contains invalid joint values.")
+            return
+        if np.any(target_q < self.model.lowerPositionLimit + 0.01) or np.any(
+            target_q > self.model.upperPositionLimit - 0.01
+        ):
+            acknowledge(False, "The sync target is outside or too close to a URDF joint limit.")
+            return
+
+        if self._below_workspace_floor(target_q):
+            acknowledge(False, f"Robot alignment rejected: {self.task_frame} is below world Z={self.workspace_min_z:.3f} m.")
+            return
+
+        now = time.monotonic()
+        current_q = self.latest_state[: self.model.nq].copy()
+        current_pose = self._tcp_pose(current_q).copy()
+        target_pose = self._tcp_pose(target_q).copy()
+        self.cartesian_path_start_pose = current_pose
+        self.cartesian_path_start_time = now
+        self.cartesian_path_duration = self.cartesian_min_duration
+        self.cartesian_path_progress = 0.0
+        self.cartesian_path_guard = ""
+        self.cartesian_path_initialized_from_state = True
+        self.cartesian_reference_poses = [
+            current_pose.copy() for _ in range(self.horizon + 1)
+        ]
+        self.target_pose = target_pose
+        self.previous_target_pose = target_pose.copy()
+        self._reset_pose_velocity_estimate(target_pose, now)
+        self.xref = np.r_[target_q, np.zeros(self.model.nv)]
+        state_reference = np.r_[target_q, np.zeros(self.model.nv)]
+        self.xs = [state_reference.copy() for _ in range(self.horizon + 1)]
+        self.us = [np.zeros(self.model.nv) for _ in range(self.horizon)]
+        self.stationary_hold_active = False
+        self.stationary_hold_q = None
+        self.target_update_count += 1
+        self.last_target_update_monotonic = now
+        self.last_target_stamp_s = (
+            float(message.header.stamp.sec)
+            + float(message.header.stamp.nanosec) * 1.0e-9
+        )
+        if not self.execution_enabled:
+            # Align the mock plant while paused, before F6 enables physical
+            # output. This command remains on the simulation-only boundary.
+            self.cartesian_path_start_pose = target_pose.copy()
+            self._paused_alignment_target = target_q.copy()
+            self._paused_alignment_deadline = now + 2.0
+            self._publish_joint_command(target_q)
+            if self.internal_simulation:
+                self.sim_q = target_q.copy()
+                self.sim_v.fill(0.0)
+                self.sim_acceleration.fill(0.0)
+                self.latest_state = np.r_[self.sim_q, self.sim_v]
+                self._publish_sim_state()
+        self._publish_target_pose()
+        self.get_logger().info("Desired TCP pose synchronized from mapped robot joint state.")
+        acknowledge(True, "Applied the desired pose computed from the robot joint posture.")
 
     def _solver_is_numerically_stationary(self) -> bool:
         """Recognize FDDP's false negative at a zero-step optimum."""
@@ -1234,7 +1270,7 @@ class CrocoddylMPCNode(Node):
             q_cmd = self._safe_joint_command(self.stationary_hold_q, state)
         else:
             q_cmd = self._safe_joint_command(state[: self.model.nq], state)
-        guard_success = not bool(self.cartesian_path_guard)
+        guard_success = not bool(self._command_guard())
         if not guard_success:
             self.stationary_hold_active = False
         current_pose = self._tcp_pose(state[: self.model.nq]).copy()
@@ -1245,7 +1281,7 @@ class CrocoddylMPCNode(Node):
         self.solve_time_pub.publish(Float64(data=0.0))
         self.solve_iterations_pub.publish(Float64(data=0.0))
         self.solve_success_pub.publish(Float64(data=1.0))
-        self.status_pub.publish(String(data=self.cartesian_path_guard or "stationary_hold"))
+        self.status_pub.publish(String(data=self._command_guard() or "stationary_hold"))
         self.control_norm_pub.publish(Float64(data=0.0))
         self.task_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error))))
         self.position_error_pub.publish(Float64(data=float(np.linalg.norm(pose_error[:3]))))
@@ -1256,23 +1292,79 @@ class CrocoddylMPCNode(Node):
         self._publish_pose(self.current_pose_pub, current_pose)
         self._publish_qref()
         self.solve_count += 1
-        self._write_diagnostic(
-            status=self.cartesian_path_guard or "stationary_hold",
-            state=state,
-            target=self.target_pose,
-            solver_success=True,
-            solver_cost=self.stationary_hold_cost,
-            q_cmd=q_cmd,
-            current_pose=current_pose,
-            pose_error=pose_error,
-            stationary_optimum=True,
-            cost_terms={},
-            terminal_cost_terms={},
-            dynamics={},
-        )
+        if self._diagnostics_due():
+            self._write_diagnostic(
+                status=self._command_guard() or "stationary_hold",
+                state=state,
+                target=self.target_pose,
+                solver_success=True,
+                solver_cost=self.stationary_hold_cost,
+                q_cmd=q_cmd,
+                current_pose=current_pose,
+                pose_error=pose_error,
+                stationary_optimum=True,
+                cost_terms=self.last_cost_terms,
+                terminal_cost_terms=self.last_terminal_cost_terms,
+                dynamics=self.last_dynamics,
+            )
         self._publish_command_pose(q_cmd)
 
+    def _set_execution_enabled(self, enabled):
+        self.execution_enabled = bool(enabled)
+        self._paused_alignment_target = None
+        if self.latest_state is None:
+            return
+        q = self.latest_state[:self.model.nq].copy()
+        current = self._tcp_pose(q).copy()
+        self.target_pose = current
+        self.previous_target_pose = current.copy()
+        self._reset_pose_velocity_estimate(current)
+        self.cartesian_path_start_pose = current.copy()
+        self.cartesian_path_start_time = time.monotonic()
+        self.cartesian_path_duration = self.cartesian_min_duration
+        self.cartesian_path_progress = 0.0
+        self.xref = np.r_[q, np.zeros(self.model.nv)]
+        self.xs = [self.xref.copy() for _ in range(self.horizon + 1)]
+        self.us = [np.zeros(self.model.nv) for _ in range(self.horizon)]
+        self.stationary_hold_active = False
+        self.target_update_count += 1
+        if not enabled:
+            self.sim_v.fill(0.0)
+            self.sim_acceleration.fill(0.0)
+            if time.monotonic() - self.last_state_update_monotonic <= 0.5:
+                self._publish_joint_command(q)
+
+    def _publish_paused(self):
+        now = time.monotonic()
+        if now - self._last_paused_publish < 0.1:
+            return
+        self._last_paused_publish = now
+        self._publish_pose(self.current_pose_pub, self._tcp_pose(self.latest_state[:self.model.nq]))
+        self._publish_target_pose()
+        self._publish_qref()
+        self.status_pub.publish(String(data="paused_waiting_for_f7"))
+        if self.internal_simulation:
+            self._publish_sim_state()
+
     def _solve_once(self) -> None:
+        callback_start = time.perf_counter()
+        try:
+            self._solve_once_impl()
+        finally:
+            publisher = getattr(self, "callback_time_pub", None)
+            if publisher is not None:
+                publisher.publish(
+                    Float64(data=1.0e3 * (time.perf_counter() - callback_start))
+                )
+
+    def _diagnostics_due(self) -> bool:
+        now = time.monotonic()
+        if now - self._last_diagnostic_time < self.diagnostic_period:
+            return False
+        self._last_diagnostic_time = now
+        return True
+
+    def _solve_once_impl(self) -> None:
         if self.internal_simulation:
             self.latest_state = np.r_[self.sim_q, self.sim_v]
             self.last_state_update_monotonic = time.monotonic()
@@ -1283,14 +1375,54 @@ class CrocoddylMPCNode(Node):
                 self.warned_no_state = True
             return
 
+        state_age = time.monotonic() - self.last_state_update_monotonic
+        if not np.isfinite(state_age) or state_age > self.joint_state_timeout:
+            self._paused_alignment_target = None
+            if self.execution_enabled:
+                self.solve_success_pub.publish(Float64(data=0.0))
+                self.status_pub.publish(String(data="joint_state_stale"))
+                self.get_logger().error(
+                    "Joint state is stale; MPC output is suspended until fresh feedback returns.",
+                    throttle_duration_sec=2.0,
+                )
+            else:
+                self.status_pub.publish(String(data="paused_joint_state_stale"))
+            return
+
+        if self.vive_control is not None:
+            self.vive_control.before_solve()
+        if not self.execution_enabled:
+            if self._paused_alignment_target is not None:
+                if (time.monotonic() > self._paused_alignment_deadline
+                        or np.allclose(self.latest_state[:self.model.nq], self._paused_alignment_target,
+                                       rtol=0, atol=1e-5)):
+                    self._paused_alignment_target = None
+                else:
+                    # Repeat until measured feedback confirms application;
+                    # the controller/subscription may still be activating.
+                    self._publish_joint_command(self._paused_alignment_target)
+            self._publish_paused()
+            return
+
         state = self.latest_state.copy()
+        if self._below_workspace_floor(state[:self.model.nq]):
+            self._publish_joint_command(state[:self.model.nq])
+            self.solve_success_pub.publish(Float64(data=0.0))
+            self.status_pub.publish(String(data="workspace_floor_violation"))
+            self.get_logger().error(
+                f"Measured {self.task_frame} is below world Z={self.workspace_min_z:.3f} m; holding joints.",
+                throttle_duration_sec=2.0,
+            )
+            return
         if not self.cartesian_path_initialized_from_state:
             self.cartesian_path_start_pose = self._tcp_pose(state[: self.model.nq]).copy()
             self.cartesian_path_start_time = time.monotonic()
             self.cartesian_path_initialized_from_state = True
         self._update_cartesian_references(state[: self.model.nq])
         if self.simulate and self.control_mode == "task_space" and not self.stationary_hold_active:
-            pose_error = self._pose_error(state[: self.model.nq], self.target_pose, self.pose_data)
+            pose_error = self._pose_error(
+                state[: self.model.nq], self._optimization_target_pose(), self.pose_data
+            )
             # The ideal position servo can stop on the measured pose without another torque solve.
             if (
                 np.linalg.norm(pose_error[:3]) <= self.stationary_hold_position_tolerance
@@ -1317,6 +1449,7 @@ class CrocoddylMPCNode(Node):
         self.xs[0] = state.copy()
         self.last_target_acceleration.fill(np.nan)
         self.last_applied_acceleration.fill(np.nan)
+        diagnostics_due = self._diagnostics_due()
         solve_start = time.perf_counter()
         try:
             solved = bool(self.solver.solve(self.xs, self.us, self.max_solver_iterations, False))
@@ -1325,14 +1458,15 @@ class CrocoddylMPCNode(Node):
             self.get_logger().error(f"MPC solve 실패: {exc}")
             self.solve_success_pub.publish(Float64(data=0.0))
             self.status_pub.publish(String(data="exception"))
-            self._write_diagnostic(
-                status="exception",
-                state=state,
-                target=self.target_pose,
-                solve_time_ms=solve_time_ms,
-                solver_iterations=int(getattr(self.solver, "iter", 0)),
-                solver_error=repr(exc),
-            )
+            if diagnostics_due:
+                self._write_diagnostic(
+                    status="exception",
+                    state=state,
+                    target=self.target_pose,
+                    solve_time_ms=solve_time_ms,
+                    solver_iterations=int(getattr(self.solver, "iter", 0)),
+                    solver_error=repr(exc),
+                )
             return
         solve_time_ms = 1.0e3 * (time.perf_counter() - solve_start)
         solver_iterations = int(getattr(self.solver, "iter", 0))
@@ -1353,33 +1487,46 @@ class CrocoddylMPCNode(Node):
         ):
             self.solve_success_pub.publish(Float64(data=0.0))
             self.status_pub.publish(String(data="invalid_solution"))
-            self._write_diagnostic(
-                status="invalid_solution",
-                state=state,
-                solver_iterations=solver_iterations,
-                solver_cost=solver_cost,
-                target=self.target_pose,
-                solve_time_ms=solve_time_ms,
-            )
+            if diagnostics_due:
+                self._write_diagnostic(
+                    status="invalid_solution",
+                    state=state,
+                    solver_iterations=solver_iterations,
+                    solver_cost=solver_cost,
+                    target=self.target_pose,
+                    solve_time_ms=solve_time_ms,
+                )
             return
         self.xs, self.us = self.solver.xs, self.solver.us
         cost = solver_cost
         raw_control = np.asarray(self.us[0], dtype=float).copy()
         current_pose = self._tcp_pose(state[:6]).copy()
         task_error = self._pose_error(state[:6], self.target_pose, self.pose_data)
-        jacobian = self._jacobian_record(state[:6], current_pose)
-        cost_terms = self.running_action.cost_terms(state, raw_control)
-        terminal_cost_terms = self.terminal_action.cost_terms(
-            self.xs[-1], np.zeros(self.model.nv)
+        optimization_error = self._pose_error(
+            state[:6], self._optimization_target_pose(), self.pose_data
         )
-        dynamics = self.running_action.dynamics_terms(state, raw_control)
-        self.last_dynamics = dynamics
+        if diagnostics_due:
+            jacobian = self._jacobian_record(state[:6], current_pose)
+            cost_terms = self.running_action.cost_terms(state, raw_control)
+            terminal_cost_terms = self.terminal_action.cost_terms(
+                self.xs[-1], np.zeros(self.model.nv)
+            )
+            dynamics = self.running_action.dynamics_terms(state, raw_control)
+            self.last_cost_terms = dict(cost_terms)
+            self.last_terminal_cost_terms = dict(terminal_cost_terms)
+            self.last_dynamics = dynamics
+        else:
+            jacobian = {}
+            cost_terms = dict(self.last_cost_terms)
+            terminal_cost_terms = dict(self.last_terminal_cost_terms)
+            dynamics = self.last_dynamics
         self.cost_pub.publish(Float64(data=cost))
-        for name, publisher in self.cost_term_pubs.items():
-            publisher.publish(Float64(data=float(cost_terms.get(name, 0.0))))
-        self.terminal_cost_pub.publish(
-            Float64(data=float(sum(terminal_cost_terms.values())))
-        )
+        if diagnostics_due:
+            for name, publisher in self.cost_term_pubs.items():
+                publisher.publish(Float64(data=float(cost_terms.get(name, 0.0))))
+            self.terminal_cost_pub.publish(
+                Float64(data=float(sum(terminal_cost_terms.values())))
+            )
         self.task_error_pub.publish(Float64(data=float(np.linalg.norm(task_error))))
         self.position_error_pub.publish(Float64(data=float(np.linalg.norm(task_error[:3]))))
         self.orientation_error_pub.publish(Float64(data=float(np.linalg.norm(task_error[3:]))))
@@ -1414,20 +1561,20 @@ class CrocoddylMPCNode(Node):
                 q_cmd = self._safe_joint_command(state[: self.model.nq], state)
         else:
             q_cmd = self._safe_joint_command(next_state[: self.model.nq], state)
-        prediction_guard = prediction_guard or self.cartesian_path_guard
+        prediction_guard = prediction_guard or self._command_guard()
         self.last_q_cmd = q_cmd.copy()
         self._publish_joint_command(q_cmd)
         stationary_hold_ready = bool(
             stationary_optimum
             and not prediction_guard
-            and float(np.linalg.norm(task_error[:3]))
+            and float(np.linalg.norm(optimization_error[:3]))
             <= self.stationary_hold_position_tolerance
-            and float(np.linalg.norm(task_error[3:]))
+            and float(np.linalg.norm(optimization_error[3:]))
             <= self.stationary_hold_orientation_tolerance
         )
         solver_success = bool(solved or stationary_optimum)
         status = (
-            self.cartesian_path_guard
+            self._command_guard()
             or ("prediction_guard_hold" if prediction_guard else "")
             or ("stationary_optimum" if stationary_optimum else "")
             or ("solved" if solved else "not_converged")
@@ -1446,27 +1593,28 @@ class CrocoddylMPCNode(Node):
             self._step_simulation(q_cmd)
             self._publish_sim_state()
             applied_state = np.r_[self.sim_q, self.sim_v].copy()
-        self._write_diagnostic(
-            status=status,
-            state=state,
-            target=self.target_pose,
-            solve_time_ms=solve_time_ms,
-            solver_success=solver_success,
-            solver_iterations=solver_iterations,
-            solver_cost=cost,
-            stationary_optimum=stationary_optimum,
-            prediction_guard=prediction_guard,
-            raw_control=raw_control,
-            q_cmd=q_cmd,
-            predicted_next_state=self.xs[1],
-            applied_state=applied_state,
-            cost_terms=cost_terms,
-            terminal_cost_terms=terminal_cost_terms,
-            current_pose=current_pose,
-            pose_error=task_error,
-            jacobian=jacobian,
-            dynamics=dynamics,
-        )
+        if diagnostics_due:
+            self._write_diagnostic(
+                status=status,
+                state=state,
+                target=self.target_pose,
+                solve_time_ms=solve_time_ms,
+                solver_success=solver_success,
+                solver_iterations=solver_iterations,
+                solver_cost=cost,
+                stationary_optimum=stationary_optimum,
+                prediction_guard=prediction_guard,
+                raw_control=raw_control,
+                q_cmd=q_cmd,
+                predicted_next_state=self.xs[1],
+                applied_state=applied_state,
+                cost_terms=cost_terms,
+                terminal_cost_terms=terminal_cost_terms,
+                current_pose=current_pose,
+                pose_error=task_error,
+                jacobian=jacobian,
+                dynamics=dynamics,
+            )
         self._publish_command_pose(q_cmd)
 
     def _safe_joint_command(self, predicted_q: np.ndarray, state: np.ndarray) -> np.ndarray:
@@ -1494,9 +1642,10 @@ class CrocoddylMPCNode(Node):
             raise RuntimeError("joint-position safety filter produced a non-finite command")
         self.cartesian_command_scale = 1.0
         self.cartesian_path_guard = ""
+        self.workspace_floor_guard = ""
         if self.control_mode == "task_space":
             start = self.cartesian_path_start_pose.translation
-            goal = self.target_pose.translation
+            goal = self._optimization_target_pose().translation
             deviation = float(np.linalg.norm(segment_error(
                 self._tcp_pose(measured_q).translation, start, goal
             )[0]))
@@ -1524,6 +1673,17 @@ class CrocoddylMPCNode(Node):
                 self.cartesian_path_guard = "cartesian_path_hold"
             elif self.cartesian_command_scale < 1.0 or not np.array_equal(command, original_command):
                 self.cartesian_path_guard = "cartesian_path_limited"
+        if self.workspace_floor_enabled:
+            command, scale = limit_height_step(
+                measured_q, command, lambda q: self._tcp_pose(q).translation.copy(),
+                self._tcp_position_jacobian, self.workspace_min_z, self.cartesian_reach_bound,
+            )
+            if self._below_workspace_floor(measured_q):
+                self.workspace_floor_guard = "workspace_floor_violation"
+            elif scale == 0.0:
+                self.workspace_floor_guard = "workspace_floor_hold"
+            elif scale < 1.0:
+                self.workspace_floor_guard = "workspace_floor_limited"
         return command
 
     def _tcp_position_jacobian(self, q: np.ndarray) -> np.ndarray:
@@ -1556,8 +1716,8 @@ class CrocoddylMPCNode(Node):
         self.sim_acceleration = (self.sim_v - previous_velocity) / self.dt
         self.last_target_acceleration = np.clip(
             self.sim_acceleration,
-            -self.acceleration_limits,
-            self.acceleration_limits,
+            -self.diagnostic_acceleration_clip,
+            self.diagnostic_acceleration_clip,
         )
         self.last_applied_acceleration = self.sim_acceleration.copy()
 

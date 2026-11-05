@@ -6,7 +6,8 @@ if [[ $# -lt 3 ]]; then
     exit 2
 fi
 
-build_root=$1
+dev_root=$1
+build_root=$dev_root
 shift
 base_paths=()
 while (($#)) && [[ $1 != -- ]]; do
@@ -22,6 +23,12 @@ if (($# == 0)); then
     set -- bash
 fi
 
+# Keep colcon artifacts owned by the active container user. Older builds may
+# have been created as container root (shown as `nobody` on a user-namespaced
+# Docker host), which prevents a later non-root build from updating the cache.
+build_root="${build_root}/users/uid-$(id -u)"
+mkdir -p "$build_root"
+
 source "/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash"
 if [[ -f /opt/robot-teleoperation-venv/bin/activate ]]; then
     source /opt/robot-teleoperation-venv/bin/activate
@@ -31,13 +38,23 @@ if [[ -f /opt/robot_teleoperation_framework/install/setup.bash ]]; then
 fi
 
 if [[ ! -f "$build_root/install/setup.bash" || "${FORCE_COLCON_BUILD:-0}" == 1 ]]; then
-    python3 -m colcon --log-base "$build_root/log" build \
-        --symlink-install --merge-install \
-        --base-paths "${base_paths[@]}" \
-        --build-base "$build_root/build" \
-        --install-base "$build_root/install"
+    exec 8>"$build_root/colcon-build.lock"
+    flock 8
+    if [[ ! -f "$build_root/install/setup.bash" || "${FORCE_COLCON_BUILD:-0}" == 1 ]]; then
+        python3 -m colcon --log-base "$build_root/log" build \
+            --symlink-install --merge-install \
+            --base-paths "${base_paths[@]}" \
+            --build-base "$build_root/build" \
+            --install-base "$build_root/install"
+    fi
+    flock -u 8
+    exec 8>&-
 fi
 
 source "$build_root/install/setup.bash"
+# RViz must save into the writable development mount, not its installed
+# (possibly symlinked/read-only) package config. A directory permits Qt's
+# temporary-file + rename save operation and survives container recreation.
+export ROBOT_RVIZ_CONFIG="${ROBOT_RVIZ_CONFIG:-$dev_root/rviz/indy7.rviz}"
 cd /workspace
 exec "$@"

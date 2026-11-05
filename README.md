@@ -4,7 +4,7 @@ Neuromeka Indy7 조작 및 task-space MPC 실험을 위한 ROS 2 저장소입니
 이 저장소의 공식 사용 경로는 Docker입니다. 호스트에는 Docker Engine 또는 Docker
 Desktop만 준비하면 되며, ROS 2와 MPC 의존성은 이미지 안에 설치됩니다.
 
-기본 빌드는 Robot MPC와 Vive Tracker ROS 2 패키지를 사용합니다. MANUS-WUJI 손
+기본 빌드는 Robot MPC를 사용합니다. Vive Tracker 입력과 MANUS-WUJI 손
 리타게팅은 같은 workspace에 배치된 선택형 Git submodule입니다.
 
 - `robot_description`: 공용 모델 패키지. 현재 Indy7 URDF와 mesh를 포함합니다.
@@ -36,6 +36,7 @@ IndyDCP3 연결에는 명시적 arm 서비스, deadman/명령 timeout, URDF 관�
 │       └── indy7_mpc_test.py
 ├── requirements/
 │   ├── robot-mpc.txt
+│   ├── robot-mpc-constraints.txt
 │   └── neuromeka-dcp3.txt
 ├── ros2_ws/
 │   ├── README.md
@@ -115,7 +116,7 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-build INCLUDE_HAND=1` | MPC, DCP3를 빌드한 뒤 Hand 이미지도 별도로 빌드합니다. 총 3개 이미지입니다. |
 | `make docker-build-dcp3` | Indy 실기 연결용 DCP3 이미지만 빌드합니다. |
 | `make docker-build-hand` | MANUS-WUJI Hand 이미지 하나만 빌드합니다. Indy 이미지는 빌드하지 않습니다. |
-| `make docker-build-gui` | RViz 실행에 필요한 별도 `mpc-gui` 이미지를 빌드합니다. |
+| `make docker-build-gui` | RViz와 Qt teleoperation GUI에 필요한 별도 `mpc-gui` 이미지를 빌드합니다. |
 | `make docker-test` | 이미 빌드된 MPC와 DCP3 이미지의 colcon 테스트 결과를 표시합니다. |
 | `make docker-run` | 저장소 소스를 마운트하고 source overlay를 준비해 셸을 엽니다. ROS launch는 직접 실행합니다. |
 | `make docker-run-gui` | GUI 지원 이미지가 없을 때만 빌드하고, 마운트된 source overlay로 셸을 엽니다. |
@@ -124,9 +125,10 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-check-robot ROBOT_IP=<주소>` | DCP3 연결/feedback 확인용 컨테이너만 실행합니다. MPC는 시작하지 않습니다. |
 | `make docker-up-robot ROBOT_IP=<주소>` | GUI 지원 MPC/DCP3 개발 컨테이너만 백그라운드로 준비합니다. ROS 노드는 자동 실행하지 않습니다. |
 | `make docker-shell-robot ROBOT_IP=<주소> ROBOT_SERVICE=<service>` | `ROBOT_SERVICE`를 `mpc` 또는 `dcp3`로 지정해 해당 컨테이너 shell에 들어갑니다. |
-| `make docker-down-robot` | Robot Compose 컨테이너를 종료하고 정리합니다. |
+| `make docker-down-robot` | Indy7 Compose 컨테이너를 종료하고 정리합니다. |
 | `make docker-up-robot-sim` | 실제 IP 없이 MPC 시뮬레이션 컨테이너만 시작합니다. DCP3 컨테이너는 시작하지 않습니다. |
-| `make docker-launch-robot-sim` | mock ros2_control 시뮬레이션, RViz, MPC plot을 실행합니다. |
+| `make docker-launch-robot-sim` | mock ros2_control 시뮬레이션, RViz, MPC plot, teleoperation GUI를 실행합니다. |
+| `make docker-launch-robot-sim-minimal` | 기존 GUI는 유지하고, 조인트 매핑과 TCP 키보드 제어에 집중한 최소 GUI로 시뮬레이션을 실행합니다. |
 | `make docker-keyboard-robot-sim` | 별도 터미널에서 키보드 TCP teleoperation을 실행합니다. |
 | `make docker-down-robot-sim` | simulation MPC 컨테이너를 중지합니다. |
 
@@ -139,6 +141,32 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 셸에서 직접 launch하며 `simulate`의 기본값은 `true`입니다. 소스 편집은 실행 중인 Python
 프로세스에 자동 반영되지 않으므로, 수정한 노드나 launch 코드는 MPC를 재시작해야 적용됩니다.
 
+새 최소 teleoperation GUI는 `FORCE_COLCON_BUILD=1 make docker-launch-robot-sim-minimal`로
+실행합니다. 기존 전체 GUI는 `make docker-launch-robot-sim` 타깃에서 그대로 사용할 수 있습니다.
+최소 GUI 타깃은 Vive 매핑 노드도 함께 실행합니다. GUI의 `Hand Target Teleoperation` 패널에서
+입력과 hand TCP가 준비되면 `Map / Sync Current Pose (F5)`를 누르면 됩니다.
+이 타깃은 MPC를 대기 상태로 시작합니다. F5 매핑 후 F7을 누르고 있는 동안
+로봇 연결 없이 시뮬레이션의 hand TCP가 Vive 목표를 추종하고, F7을 놓으면 정지합니다.
+GUI의 Run 버튼도 누르고 있는 동안만 실행됩니다. GUI 포커스 이탈·종료 시에도
+정지하며, GUI 입력 유지 신호가 0.35초 이상 끊기면 MPC가 추종을 중단합니다.
+GUI의 `Hand Target Teleoperation`에서 `Keyboard`와 `Topic Pose`를 선택할 수 있습니다.
+두 모드 모두 `hand_tcp`가 공통 `hand_target`을 추종합니다. Keyboard는 트래커 없이
+현재 hand 자세에서 키·버튼으로 목표를 편집하고, Topic Pose는 선택한 pose 토픽을
+F5로 매핑합니다. F7을 놓은 뒤 모드를 바꾸고, 다시 누르고 있어야 실행됩니다.
+F6는 실측 관절로 시뮬레이션 정렬과 목표 재매핑을 수행한 뒤 DCP3 teleoperation을
+켜며, 다시 누르면 끕니다. 연결 중에는 F7을 누르고 있는 동안 로봇도 추종하고,
+F7을 놓으면 현재 자세에서 대기합니다. DCP3 드라이버는 별도 터미널에서
+`FORCE_COLCON_BUILD=1 make docker-launch-robot-dcp3 ROBOT_IP=실제_IP`로 실행합니다.
+
+Indy7 `hand_tcp` 정의와 Vive pose의 Indy7 world 매핑은
+[`robot_mpc/README.md`](ros2_ws/src/robot_mpc/README.md)에 정리되어 있습니다.
+단독 매핑 GUI는 `ros2 launch robot_mpc robot_vive_mapping.launch.py gui:=true`로
+실행합니다. 최소 GUI 타깃을 사용할 때는 매핑 노드를 중복 실행하지 않습니다.
+F5 또는 `/robot/vive_mapping/sync` 서비스로 현재 Vive pose를 현재 hand TCP에
+동기화합니다. 입력 기본값은 `/tracker/right/pose`, 출력은
+`/robot/vive/hand_target_pose`입니다. 단독 매핑 launch는 pose/TF 확인용이며,
+최소 GUI에서는 F7로 시뮬레이션 MPC 추종을 시작합니다.
+
 MPC cost 항목은 예외로, 실행 중인 노드가 로컬 마운트 파일을 0.25초 간격으로 확인합니다.
 호스트에서 다음 파일을 저장하면 컨테이너 안의 같은 파일이 즉시 보이고, 유효한 cost 변경은
 현재 solver에 다시 반영됩니다. YAML을 잠시 잘못된 상태로 저장해도 마지막 유효 설정을 유지하고,
@@ -147,6 +175,10 @@ MPC cost 항목은 예외로, 실행 중인 노드가 로컬 마운트 파일을
 ```text
 ros2_ws/src/robot_mpc/config/indy7_mpc.yaml
 ```
+
+최종본에는 목표 pose 변화에서 관절 속도 reference를 만드는 feedforward 구현이 포함됩니다.
+기본값은 `pose_velocity_feedforward_enabled: false`입니다. 실험하려면 같은 YAML에서
+`true`로 바꾸고 MPC를 재시작합니다. 이 항목은 실행 중 cost 재로딩 대상이 아닙니다.
 
 실행 중 바꿀 수 있는 항목은 `se3_position_cost_weight`, `se3_orientation_cost_weight`,
 `posture_cost_weight`, `velocity_cost_weight`, `torque_cost_weight`,
@@ -207,6 +239,49 @@ docker exec -it robot-teleoperation bash -lc \
 
 두 토픽에 6관절 데이터가 나오면 simulation state와 MPC command 경로가 동작 중입니다.
 launch는 `Ctrl+C`로 종료합니다.
+
+### 시뮬레이션 자세를 DCP3 실제 로봇에 보내는 GUI
+
+GUI는 관절 이름 순서, 회전 방향, 영점 오프셋(도)을 편집하고 변환된 실제 관절 목표와
+측정값을 나란히 보여줍니다. `실제 자세 → 시뮬레이션 동기화`를 누르면 실측 관절값을
+역매핑해 MPC에 전달하고, MPC가 그 관절 자세의 FK로 Desired TCP pose를 설정합니다.
+이후 시뮬레이션의 현재 관절값을 매핑해 DCP3 명령으로 보냅니다. 초기 매핑은 관절별
+1:1, 방향 +1, 오프셋 0도이며 설정은 `.docker-data/robot-mpc/profiles/indy7_joint_mapping.yaml`에 저장됩니다.
+
+GUI 이미지에는 PyQt5가 필요하므로 한 번 빌드하거나 갱신합니다. 새 GUI 실행 항목과
+package metadata를 overlay에 등록하기 위해 기존 overlay가 있으면 첫 실행에 강제 빌드합니다.
+
+```bash
+make docker-build-gui
+make docker-up-robot ROBOT_IP=controller-address
+```
+
+터미널 1에서 DCP3 피드백 adapter를 시작합니다.
+
+```bash
+make docker-shell-robot ROBOT_IP=controller-address ROBOT_SERVICE=dcp3
+ros2 launch robot_dcp3 robot_dcp3.launch.py robot_ip:=$ROBOT_IP
+```
+
+터미널 2에서 MPC 시뮬레이션과 GUI를 시작합니다. `make docker-up-robot`이 MPC와 DCP3
+개발 컨테이너를 모두 준비했으므로, 아래 실행 명령으로 mock 시뮬레이션만 launch됩니다.
+이미 만들어 둔 overlay를 사용 중이면 `FORCE_COLCON_BUILD=1`을 첫 실행에 추가합니다.
+
+```bash
+make docker-launch-robot-sim FORCE_COLCON_BUILD=1
+```
+
+GUI에서 실제 관절 매핑을 확인·저장하고, **실제 자세 → 시뮬레이션 동기화**를 눌러
+시뮬레이션이 실측 자세에 도달하는지 확인합니다. Desired TCP pose는 이 자세에서
+계산됩니다. 목표를 XYZ·회전 버튼으로 조정한 다음, **매핑된 시뮬레이션 목표 전송 허용**을
+켜고 **Deadman 버튼을 누른 채 Arm**을 선택합니다. 시작 목표와 실측 로봇의 최대 관절
+오차가 기본 10°보다 크면 GUI에서 Arm을 막습니다. 매핑 오프셋을 조정하거나 다시
+동기화한 뒤 시작하세요. Deadman을 놓거나 창 포커스를 잃으면 adapter가 정지·disarm합니다.
+창을 닫으면 disarm 서비스를 요청합니다.
+
+정상 종료는 GUI의 **Disarm / 정지**를 누른 뒤 GUI와 DCP3 launch를 `Ctrl+C`로 종료하고,
+`make docker-down-robot`을 실행합니다. `make docker-up-robot-sim`만 사용하면 DCP3
+adapter가 시작되지 않으므로 실제 로봇 연결은 수행되지 않습니다.
 
 MANUS-WUJI는 독립 이미지와 컨테이너를 사용합니다. 다음 명령은 Hand 이미지와 MANUS
 publisher를 준비하지만, WUJI 드라이버와 retargeting launch는 자동으로 시작하지 않습니다.
@@ -406,6 +481,20 @@ make docker-run-gui
 이 명령은 `XAUTHORITY` 환경 변수를 사용하며, 설정되지 않았으면 `~/.Xauthority`를
 사용합니다. 컨테이너에는 Xauthority 파일을 읽기 전용으로 연결합니다.
 
+RViz 설정은 호스트의 `.docker-data/robot-mpc/rviz/indy7.rviz`와 컨테이너의
+`/var/lib/robot-teleoperation-dev/rviz/indy7.rviz`가 읽기·쓰기 마운트로 연결됩니다.
+처음 실행할 때만 1000×720 기본 설정을 복사하고, 이후에는 저장된 파일을 재사용합니다.
+RViz 창 크기·패널·카메라를 조정한 뒤 RViz에서 `Ctrl+S` 또는 `File -> Save Config`를
+누르면 로컬 파일에 저장됩니다. 다음 실행, 컨테이너 재생성, colcon 재빌드 후에도
+유지됩니다. 다른 파일을 쓰려면 launch의 `rviz_config:=<컨테이너 경로>`로 지정하세요.
+
+GUI 컨테이너는 기본적으로 소프트웨어 OpenGL 렌더링을 사용합니다. GPU 장치를
+전달하지 않는 환경에서 `failed to load driver: iris` 오류로 RViz가 표시되지 않는
+문제를 방지합니다. 기존 컨테이너에는 설정이 자동 반영되지 않으므로, 실행 중인
+launch를 종료하고 `make docker-up-robot-sim`으로 컨테이너를 갱신한 뒤
+`make docker-launch-robot-sim`을 다시 실행하세요. `make docker-run-gui`로 연 셸은
+종료 후 같은 명령으로 다시 여세요. 이미지 재빌드는 필요 없습니다.
+
 컨테이너를 직접 실행할 때는 `bash`를 명령으로 지정해 셸을 열 수 있습니다.
 `--net=host`와 `--ipc=host`는 ROS 2 DDS 통신을 호스트와 맞추기 위한 옵션입니다.
 
@@ -458,14 +547,14 @@ docker rm -f robot-teleoperation
 
 ## Detailed documentation
 
-- [Indy7 MPC 시작점](robots/indy7/README.md)
+- [Robot MPC 시작점](robots/indy7/README.md)
 - [ROS 2 패키지, 토픽, 파라미터 및 실험 방법](ros2_ws/README.md)
 - [MANUS-WUJI 손 리타게팅 모듈](ros2_ws/src/hand_retargetting/README.md)
 
 ## Hardware boundary
 
-`robot_dcp3`는 Neuromeka의 `IndyDCP3` client를 통해 `/joint_states`를 내보내고,
-`/mpc/joint_position_cmd`를 `TELE_JOINT_ABSOLUTE` 관절 명령으로 전달합니다. 기본은
+`robot_dcp3`는 Neuromeka의 `IndyDCP3` client를 통해 `/robot_dcp3/joint_states`를 내보내고,
+`/robot_dcp3/joint_position_cmd`를 `TELE_JOINT_ABSOLUTE` 관절 명령으로 전달합니다. 기본은
 disarmed이며 명령과 deadman이 계속 들어오고 로봇이 IDLE일 때만 arm할 수 있습니다.
 deadman 또는 MPC 명령이 끊기거나 관절 제한을 벗어나면 teleop을 정지합니다.
 
@@ -491,11 +580,11 @@ deadman publisher는 실행 중인 채로 두고, 별도 DCP3 shell에서만 arm
 `source`나 `colcon build`를 반복하지 않습니다. 소스는 `/workspace`에 read-only bind mount되어
 있어 편집은 호스트에서 하고, Python/launch/YAML 변경은 관련 노드를 재시작하면 반영됩니다.
 
-MPC, ros2_control 시뮬레이션, DCP3 피드백/명령 주기 설정은 모두 200 Hz(5 ms)입니다.
+MPC와 ros2_control 시뮬레이션은 200 Hz(5 ms), DCP3 피드백/명령은 400 Hz(2.5 ms)로 설정되어 있습니다.
 시뮬레이션은 `calculate_dynamics: true`로 위치 변화에 따른 관절 속도를 계산합니다.
 MPC YAML의 `cartesian_max_speed`는 `0.5 m/s`, `cartesian_max_angular_speed`는
 `3.0 rad/s`입니다. DCP3의 `max_joint_velocity` 파라미터와 주기별 목표 커팅은
-제거했으며, MPC의 관절 속도·증분 제한과 DCP3 속도·가속도 비율 20%는 적용됩니다.
+제거했으며, MPC의 관절 속도·증분 제한과 DCP3 속도 비율 0.7%, 가속도 비율 1%는 적용됩니다.
 먼저 시뮬레이션에서 확인하고,
 실기에서는 `cartesian_max_speed`만 보수적으로 한 단계씩 바꿔 작은 직선 동작으로 검증합니다.
 계획 상한과 실제 TCP 응답을 구분해 진단 로그에서 확인합니다.

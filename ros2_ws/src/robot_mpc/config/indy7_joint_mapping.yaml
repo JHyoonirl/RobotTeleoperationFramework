@@ -1,0 +1,8 @@
+# q_robot = direction * q_simulation + offset_deg
+joint_mapping:
+  joint0: {simulation_joint: joint0, direction: 1, offset_deg: 0.0}
+  joint1: {simulation_joint: joint1, direction: 1, offset_deg: 0.0}
+  joint2: {simulation_joint: joint2, direction: 1, offset_deg: 0.0}
+  joint3: {simulation_joint: joint3, direction: 1, offset_deg: 0.0}
+  joint4: {simulation_joint: joint4, direction: 1, offset_deg: 0.0}
+  joint5: {simulation_joint: joint5, direction: 1, offset_deg: 0.0}

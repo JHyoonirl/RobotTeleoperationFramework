@@ -103,8 +103,8 @@ MPC의 tracking residual은 Pinocchio forward kinematics로 매 stage 계산된�
 `joint_state_broadcaster` 및 `forward_position_controller`가 활성화된다.
 MPC는 매 주기 `mpc/joint_position_cmd`에 `Float64MultiArray([q0..q5])`를
 발행하며 launch에서 `/forward_position_controller/commands`로 remap한다.
-MPC `dt: 0.005`, ros2_control `update_rate: 200`, DCP3 `publish_rate: 200.0`으로
-제어·피드백 주기 설정을 모두 200 Hz로 맞춘다. Mock 하드웨어의 `calculate_dynamics`를
+MPC `dt: 0.005`, ros2_control `update_rate: 200`, DCP3 `publish_rate: 400.0`으로
+MPC·시뮬레이션은 200 Hz, DCP3 피드백·명령은 400 Hz로 설정한다. Mock 하드웨어의 `calculate_dynamics`를
 켜서 위치 명령의 실제 반영 차분으로 관절 속도를 계산하고 `/joint_states`에 발행한다.
 실기에서는 DCP3가 제공하는 실제 `qdot`을 사용한다.
 200 Hz는 설정 목표 주기이며 Python MPC 계산이 5 ms를 넘으면 실제 최적화 빈도는
@@ -181,7 +181,7 @@ docker exec robot-teleoperation bash -lc \
 `plots/summary.json`이 생성된다. `summary.json`에는 cost·tracking·solver·ABA
 동역학의 최종값/평균/최댓값이 들어 있다.
 
-입력 pose의 `header.frame_id`는 기본적으로 `world`여야 한다. 다른 frame을 쓰려면 먼저 TF 변환을 추가하거나 `pose_frame`을 맞춘다. `q_cmd`에는 URDF hard joint limit, measured-q 기준 velocity limit, cycle increment limit을 모두 적용한다. 실기에서는 `mpc/joint_position_cmd`를 IndyDCP3 adapter의 입력으로 사용하고, adapter에서 rad→deg 변환과 deadman/명령 watchdog을 적용한다. 물리 E-stop은 별도로 준비해야 한다. 실행 중 Crocoddyl 전체 목적함수 값은 다음 토픽에서 확인할 수 있다.
+입력 pose의 `header.frame_id`는 기본적으로 `world`여야 한다. 다른 frame을 쓰려면 먼저 TF 변환을 추가하거나 `pose_frame`을 맞춘다. `q_cmd`에는 URDF hard joint limit, measured-q 기준 velocity limit, cycle increment limit을 모두 적용한다. 실기 launch는 내부 `mpc/joint_position_cmd`를 `/robot_dcp3/joint_position_cmd`로 remap하며 adapter가 rad→deg 변환과 deadman/명령 watchdog을 적용한다. 물리 E-stop은 별도로 준비해야 한다. 실행 중 Crocoddyl 전체 목적함수 값은 다음 토픽에서 확인할 수 있다.
 
 현재 적용 중인 Cartesian 속도 관련 YAML 파라미터는 다음과 같다.
 
@@ -196,7 +196,7 @@ cartesian_min_duration: 0.10    # 너무 짧은 목표 이동 방지 [s]
 아니다. 실제 선속도는 Jacobian 제한, MPC의 관절 명령 필터, DCP3의 속도·가속도
 비율에도 영향을 받는다. DCP3 adapter의 `max_joint_velocity`와 주기별 목표값
 커팅은 제거했다. [`indy7_dcp3.yaml`](src/robot_dcp3/config/indy7_dcp3.yaml)의
-`velocity_ratio`와 `acceleration_ratio`는 각각 20%이며 TCP 선속도 단위가 아니다.
+`velocity_ratio`와 `acceleration_ratio`는 각각 0.7%, 1%이며 TCP 선속도 단위가 아니다.
 
 끝단 선속도를 더 높이는 실험은 먼저 시뮬레이션에서 확인하고, 실기에서는 작업공간을
 비운 뒤 물리 E-stop에 손이 닿는 상태에서 작은 직선 이동으로 한 설정만 단계적으로
@@ -275,7 +275,7 @@ docker exec robot-teleoperation bash -lc \
 docker exec robot-teleoperation bash -lc \
   'source /opt/ros/jazzy/setup.bash && \
    source /opt/robot_teleoperation_framework/install/setup.bash && \
-   ros2 topic echo /mpc/joint_position_cmd'
+   ros2 topic echo /robot_dcp3/joint_position_cmd'
 
 docker exec robot-teleoperation bash -lc \
   'source /opt/ros/jazzy/setup.bash && \
@@ -359,6 +359,10 @@ docker exec robot-teleoperation bash -lc \
 
 ## Indy7 실기 teleoperation
 
+시뮬레이션의 관절 자세를 DCP3에 전달하는 GUI 절차는 최상위 README의
+[시뮬레이션 자세를 DCP3 실제 로봇에 보내는 GUI](../README.md#시뮬레이션-자세를-dcp3-실제-로봇에-보내는-gui)를 참고한다.
+실기 MPC 단독 조작은 아래 기존 흐름을 사용한다.
+
 계산과 하드웨어 연결은 별도 컨테이너다. MPC는 NumPy 2 / Crocoddyl을, DCP3 adapter는
 Neuromeka SDK와 NumPy 1을 사용하므로 같은 Python 환경에 설치하지 않는다.
 
@@ -419,7 +423,7 @@ arm 전에는 별도 확인 shell에서 실제 관절 feedback, 현재 TCP, MPC 
 
 ```bash
 make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=dcp3
-ros2 topic echo /joint_states --once
+ros2 topic echo /robot_dcp3/joint_states --once
 ros2 topic echo /robot_dcp3/deadman --once
 ```
 
@@ -427,7 +431,7 @@ ros2 topic echo /robot_dcp3/deadman --once
 make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=mpc
 ros2 topic echo /mpc/current_pose --once
 ros2 topic echo /mpc/desired_pose --once
-ros2 topic echo /mpc/joint_position_cmd --once
+ros2 topic echo /robot_dcp3/joint_position_cmd --once
 ```
 
 deadman publisher를 켜 둔 채 **다른 DCP3 shell**에서 arm한다. arm 요청은 DCP3 feedback과 MPC
@@ -453,8 +457,9 @@ ros2 service call /robot_dcp3/arm std_srvs/srv/SetBool "{data: false}"
 make docker-down-robot
 ```
 
-현재 MPC YAML의 `cartesian_max_speed`는 `0.5 m/s`이고, DCP3 피드백·명령 주기는
-200 Hz 설정이다. DCP3의 추가 관절 속도 커팅은 제거했으며 속도·가속도 비율 20%는 유지한다.
+현재 MPC YAML의 `cartesian_max_speed`는 `0.5 m/s`이고, MPC·시뮬레이션은 200 Hz,
+DCP3 피드백·명령은 400 Hz 설정이다. DCP3의 추가 관절 속도 커팅은 제거했으며
+속도 비율 0.7%, 가속도 비율 1%는 유지한다.
 속도를 높이는 실험은 `cartesian_max_speed`만 한 번에 한 단계 조정하고,
 실제 TCP 응답과 진단 로그를 확인한다. 모든 software limit/watchdog은 안전 정격이 아니며,
 물리 E-stop, 충돌 감시, 작업공간 감시를 대체하지 않는다.

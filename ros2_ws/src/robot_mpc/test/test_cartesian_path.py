@@ -1,6 +1,7 @@
 """Geometry, continuous-step bounds and the actual post-clipping command guard."""
 
 from pathlib import Path
+import time
 from unittest.mock import Mock
 
 import crocoddyl
@@ -83,16 +84,42 @@ def node():
     node.model, node.state = model, crocoddyl.StateMultibody(model)
     node.frame_id, node.pose_data = model.getFrameId("tcp"), model.createData()
     node.control_mode = "task_space"
+    node.execution_enabled = True
+    node.vive_control = None
+    node.solve_count = 0
+    node.joint_state_timeout = 0.5
+    node.last_state_update_monotonic = time.monotonic()
+    node.diagnostic_period = 0.1
+    node._last_diagnostic_time = -float("inf")
+    node.diagnostic_ik_enabled = False
+    node.workspace_floor_enabled = True
+    node.workspace_min_z = 0.10
+    node.workspace_floor_margin = 0.001
+    node.workspace_floor_guard = ""
     node.dt = 0.02
     node.command_velocity_limits = np.ones(6)
     node.command_increment_limits = np.full(6, 0.02)
     node.cartesian_path_tolerance = 0.0025
+    node.cartesian_max_speed = 0.5
+    node.cartesian_max_angular_speed = 3.0
+    node.pose_velocity_feedforward_enabled = True
+    node.pose_velocity_feedforward_gain = 0.5
+    node.pose_velocity_feedforward_filter_time_constant = 0.08
+    node.pose_velocity_feedforward_stale_decay = 0.15
+    node.pose_velocity_feedforward_max_sample_interval = 0.25
+    node.pose_velocity_feedforward_damping = 0.05
+    node.pose_velocity_feedforward_max_joint_speed = 0.5
+    node.filtered_target_linear_velocity_world = np.zeros(3)
+    node.filtered_target_angular_velocity_world = np.zeros(3)
+    node.last_pose_velocity_feedforward = np.zeros(6)
     node.cartesian_reach_bound = sum(np.linalg.norm(p.translation) for p in model.jointPlacements)
     node.cartesian_reach_bound += np.linalg.norm(model.frames[node.frame_id].placement.translation)
     node.sim_q = np.array([0.0, 0.0, -1.57, 0.0, -1.57, 0.0])
     node.cartesian_path_start_pose = node._tcp_pose(node.sim_q).copy()
     node.target_pose = node.cartesian_path_start_pose.copy()
     node.target_pose.translation += np.array([0.05, 0.0, 0.0])
+    node._feedforward_previous_target_pose = node.target_pose.copy()
+    node._feedforward_previous_update_monotonic = time.monotonic()
     return node
 
 
@@ -123,10 +150,12 @@ def test_joint_mode_keeps_existing_command_limits(node):
 
 @pytest.mark.parametrize("simulate, expected_velocity", [(True, 0.5), (False, 200.0)])
 @pytest.mark.parametrize("dt", [0.005, 0.01])
+@pytest.mark.parametrize("paused", [False, True])
 def test_mock_velocity_uses_consumed_sample_interval_and_real_feedback_is_preserved(
-    node, simulate, expected_velocity, dt
+    node, simulate, expected_velocity, dt, paused
 ):
     node.simulate = simulate
+    node.execution_enabled = not paused
     node.dt = dt
     node.internal_simulation = False
     node.joint_names = [f"joint{i}" for i in range(6)]
@@ -142,7 +171,7 @@ def test_mock_velocity_uses_consumed_sample_interval_and_real_feedback_is_preser
     # A mock position jump can produce a huge derivative on a short catch-up tick.
     message.velocity = [200.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     node._on_joint_state(message)
-    assert node.latest_state[6] == pytest.approx(expected_velocity)
+    assert node.latest_state[6] == pytest.approx(0.0 if simulate and paused else expected_velocity)
     assert node.last_state_stamp_s == pytest.approx(10.0 + 2.0 * dt)
 
 
@@ -230,6 +259,10 @@ def test_recorded_boundary_stall_can_move_inward(node):
 
 
 @pytest.mark.parametrize("status, success, label", [
+    ("workspace_floor_limited", 1.0, "FLOOR LIMITED"),
+    ("workspace_floor_hold", 0.0, "FLOOR HOLD"),
+    ("workspace_floor_violation", 0.0, "FLOOR VIOLATION | HOLD"),
+    ("joint_state_stale", 0.0, "JOINT STATE STALE"),
     ("cartesian_path_limited", 1.0, "PATH LIMITED"),
     ("cartesian_path_hold", 1.0, "PATH HOLD"),
     ("cartesian_path_violation", 1.0, "PATH VIOLATION | HOLD"),
@@ -270,6 +303,66 @@ def test_path_cost_gradient_matches_finite_difference(node, terminal):
     assert np.linalg.eigvalsh(data.Lxx).min() > 0
 
 
+def test_velocity_cost_tracks_nonzero_feedforward_reference(node):
+    weights = {name: 0.0 for name in (
+        "se3_position", "se3_orientation", "posture", "velocity", "torque", "joint_limit"
+    )}
+    weights["velocity"] = 2.0
+    action = SE3DynamicActionModel(
+        crocoddyl=crocoddyl, pin=pin, model=node.model, state=node.state,
+        frame_id=node.frame_id, target=node.target_pose, nominal_posture=node.sim_q,
+        weights=weights,
+    )
+    reference = np.array([0.1, -0.05, 0.02, 0.0, 0.03, -0.01])
+    velocity = np.array([0.2, -0.01, 0.02, 0.01, 0.01, 0.04])
+    action.update_velocity_reference(reference)
+    x, u = np.r_[node.sim_q, velocity], np.zeros(6)
+    data = action.createData()
+    action.calc(data, x, u)
+    action.calcDiff(data, x, u)
+    error = velocity - reference
+    assert data.cost == pytest.approx(0.5 * 2.0 * float(error @ error))
+    np.testing.assert_allclose(data.Lx[6:], 2.0 * error, atol=1.0e-9)
+    np.testing.assert_allclose(data.Lxx[6:, 6:], 2.000001 * np.eye(6), atol=1.0e-9)
+
+
+def test_target_twist_is_clamped_filtered_and_stale_samples_reset(node, monkeypatch):
+    clock = [10.0]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    previous = node._tcp_pose(node.sim_q).copy()
+    node._reset_pose_velocity_estimate(previous, clock[0])
+    target = previous.copy()
+    target.translation += np.array([0.1, 0.0, 0.0])
+    clock[0] += 0.1
+    node._update_pose_velocity_estimate(target, clock[0])
+    alpha = 1.0 - np.exp(-0.1 / node.pose_velocity_feedforward_filter_time_constant)
+    assert np.linalg.norm(node.last_target_linear_velocity_world) == pytest.approx(0.5)
+    assert node.filtered_target_linear_velocity_world[0] == pytest.approx(0.5 * alpha)
+    assert np.linalg.norm(node.filtered_target_angular_velocity_world) == pytest.approx(0.0)
+
+    clock[0] += node.pose_velocity_feedforward_max_sample_interval + 0.01
+    target.translation += np.array([0.1, 0.0, 0.0])
+    node._update_pose_velocity_estimate(target, clock[0])
+    np.testing.assert_array_equal(node.filtered_target_linear_velocity_world, np.zeros(3))
+    np.testing.assert_array_equal(node.filtered_target_angular_velocity_world, np.zeros(3))
+
+
+def test_joint_velocity_feedforward_is_finite_bounded_and_decays_when_stale(node, monkeypatch):
+    clock = [20.0]
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: clock[0])
+    node._reset_pose_velocity_estimate(node._tcp_pose(node.sim_q), clock[0])
+    node.filtered_target_linear_velocity_world = np.array([0.2, 0.0, 0.0])
+    node._feedforward_previous_update_monotonic = clock[0]
+
+    velocity = node._joint_velocity_feedforward(node.sim_q)
+    assert np.all(np.isfinite(velocity))
+    assert 0.0 < np.max(np.abs(velocity)) <= node.pose_velocity_feedforward_max_joint_speed
+
+    clock[0] += 1.0
+    stale_velocity = node._joint_velocity_feedforward(node.sim_q)
+    assert np.max(np.abs(stale_velocity)) < 0.001
+
+
 def test_identical_target_does_not_reanchor_an_expired_path(node):
     node.pose_frame = "world"
     node.cartesian_path_start_time = 0.0
@@ -278,7 +371,7 @@ def test_identical_target_does_not_reanchor_an_expired_path(node):
     node.last_target_update_monotonic = 0.0
     node.previous_target_pose = None
     node.target_update_count = 0
-    node._solve_ik = lambda target, seed: seed.copy()
+    node._solve_ik = Mock(side_effect=lambda target, seed: seed.copy())
     message = PoseStamped()
     message.header.frame_id = "world"
     position = node.target_pose.translation
@@ -288,8 +381,21 @@ def test_identical_target_does_not_reanchor_an_expired_path(node):
      message.pose.orientation.z, message.pose.orientation.w) = orientation
     original_start = node.cartesian_path_start_pose.copy()
     node._on_target_pose(message)
+    node._solve_ik.assert_not_called()
     np.testing.assert_array_equal(node.cartesian_path_start_pose.translation, original_start.translation)
     assert node.cartesian_path_start_time == 0.0
+
+
+def test_diagnostic_work_is_rate_limited(node, monkeypatch):
+    current_time = [5.0]
+    node.diagnostic_period = 0.1
+    node._last_diagnostic_time = 4.95
+    monkeypatch.setattr("robot_mpc.crocoddyl_mpc_node.time.monotonic", lambda: current_time[0])
+
+    assert not node._diagnostics_due()
+    current_time[0] = 5.06
+    assert node._diagnostics_due()
+    assert not node._diagnostics_due()
 
 
 @pytest.mark.parametrize("translation, rotation", [

@@ -21,6 +21,10 @@ setup(
         "console_scripts": [
             "crocoddyl_mpc_node = robot_mpc.crocoddyl_mpc_node:main",
             "keyboard_teleop = robot_mpc.keyboard_teleop:main",
+            "robot_vive_mapper = robot_mpc.vive_pose_mapper:main",
+            "robot_vive_mapping_gui = robot_mpc.vive_mapping_gui:main",
+            "robot_teleop_gui = robot_mpc.teleop_gui:main",
+            "robot_teleop_minimal_gui = robot_mpc.teleop_minimal_gui:main",
             "mpc_plotter = robot_mpc.mpc_plotter:main",
             "plot_mpc_log = robot_mpc.plot_mpc_log:main",
         ],

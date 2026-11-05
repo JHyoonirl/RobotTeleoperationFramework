@@ -1,0 +1,19 @@
+robot_vive_mapper:
+  ros__parameters:
+    # /pose already includes the Vive driver's local hand offset; apply it once.
+    input_pose_topic: /tracker/right/pose
+    input_frame: world
+    # input_frame is the source message label, NOT the Indy world. The two
+    # independent worlds are aligned by /robot/vive_mapping/sync.
+    world_frame: world
+    hand_frame: hand_tcp
+    vive_world_frame: vive_world
+    mapped_hand_frame: vive_hand_target
+    mapped_pose_topic: /robot/vive/hand_target_pose
+    current_hand_pose_topic: /robot/hand_tcp/current_pose
+    sync_service: /robot/vive_mapping/sync
+    status_topic: /robot/vive_mapping/status
+    # Message-delivery and robot TF freshness [s]; not optical tracking quality.
+    input_timeout: 0.5
+    robot_tf_timeout: 0.5
+    publish_tf: true

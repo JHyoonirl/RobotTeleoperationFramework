@@ -1,9 +1,14 @@
 # Robot DCP3 Adapter
 
 `robot_dcp3` connects the Robot MPC to Neuromeka's IndyDCP3 client. It publishes actual joint
-feedback as `/joint_states` and forwards absolute joint positions from
-`/mpc/joint_position_cmd` in DCP3 `TELE_JOINT_ABSOLUTE` mode. MPC commands are radians; DCP3
+feedback as `/robot_dcp3/joint_states` and forwards absolute joint positions from
+`/robot_dcp3/joint_position_cmd` in DCP3 `TELE_JOINT_ABSOLUTE` mode. MPC commands are radians; DCP3
 receives degrees.
+
+The adapter publishes `/robot_dcp3/armed` and `/robot_dcp3/status` for the GUI. Arm requests
+return promptly and the 400 Hz feedback loop confirms `TELE_OP` asynchronously, so deadman and
+command heartbeats continue to be processed while the controller changes modes. The GUI publishes
+the mapped simulation target and refreshes `/robot_dcp3/deadman` only while its hold button is down.
 
 `velocity_ratio` and `acceleration_ratio` use DCP3's 0-100 scale: `20.0` means
 20%. The adapter validates both values and passes them unchanged to
@@ -12,8 +17,18 @@ receives degrees.
 The adapter starts disarmed. Arming requires fresh DCP3 feedback, a fresh MPC command, a
 continuously refreshed deadman, and the robot in IDLE. It checks the selected robot URDF hard limits,
 keeps a 0.05 rad soft-limit margin, and forwards validated joint targets unchanged at
-200 Hz. The adapter does not apply an additional per-cycle joint velocity clip. A stale
+400 Hz. The adapter does not apply an additional per-cycle joint velocity clip. A stale
 command/deadman or invalid target stops teleoperation and requires a new arm request.
+
+The minimal Hand Target GUI now supports **F6 Connect Robot**. Start this adapter
+with `FORCE_COLCON_BUILD=1 make docker-launch-robot-dcp3 ROBOT_IP=controller-address`
+after `make docker-up-robot ROBOT_IP=controller-address`, and run the simulation
+GUI with `FORCE_COLCON_BUILD=1 make docker-launch-robot-sim-minimal`. F6 aligns the
+paused simulation to measured joints, re-anchors the hand target, enables the
+mapped command stream and managed Deadman, and requests this adapter's existing
+arm service. Only confirmed `TELE_OP` is shown as connected. F7 must remain held
+for MPC motion; releasing F7 holds position, and F6 again stops/disarms. See the
+[GUI workflow](../robot_mpc/README.md#f6-robot-connection-dcp3-tele_op) for details.
 
 These software checks are not safety-rated. They do not provide collision monitoring, workspace
 supervision, or a safety-rated E-stop. Keep the physical E-stop accessible and follow Neuromeka's
@@ -97,7 +112,7 @@ For ROS graph and feedback inspection, open another sourced shell:
 
 ```bash
 make docker-shell-robot ROBOT_IP=controller-address ROBOT_SERVICE=dcp3
-ros2 topic echo /joint_states --once
+ros2 topic echo /robot_dcp3/joint_states --once
 ros2 topic echo /robot_dcp3/deadman --once
 ```
 
@@ -126,7 +141,7 @@ in IDLE, the work area is clear, and the physical E-stop is immediately reachabl
 
 ```bash
 make docker-shell-robot ROBOT_IP=controller-address ROBOT_SERVICE=dcp3
-ros2 topic echo /joint_states --once
+ros2 topic echo /robot_dcp3/joint_states --once
 ros2 topic echo /robot_dcp3/deadman --once
 ```
 
@@ -134,7 +149,7 @@ ros2 topic echo /robot_dcp3/deadman --once
 make docker-shell-robot ROBOT_IP=controller-address ROBOT_SERVICE=mpc
 ros2 topic echo /mpc/current_pose --once
 ros2 topic echo /mpc/desired_pose --once
-ros2 topic echo /mpc/joint_position_cmd --once
+ros2 topic echo /robot_dcp3/joint_position_cmd --once
 ```
 
 Terminal 5: leave the deadman publisher running in Terminal 4, then explicitly arm from another
@@ -158,12 +173,12 @@ ros2 service call /robot_dcp3/arm std_srvs/srv/SetBool "{data: false}"
 Stop each manually launched ROS process with `Ctrl+C`, then remove the idle containers with
 `make docker-down-robot`.
 
-The MPC, ros2_control simulation, and DCP3 feedback/command loop are configured at 200 Hz
-(`dt: 0.005`, `update_rate: 200`, `publish_rate: 200.0`). The current MPC YAML has
+The MPC and ros2_control simulation are configured at 200 Hz, with the DCP3 feedback/command
+loop at 400 Hz (`dt: 0.005`, `update_rate: 200`, `publish_rate: 400.0`). The current MPC YAML has
 `cartesian_max_speed: 0.5` m/s and `cartesian_max_angular_speed: 3.0` rad/s.
 The adapter's `max_joint_velocity` setting and per-cycle clipping have been removed;
-joint speed/increment limits remain in the MPC. DCP3's `velocity_ratio: 20.0` and
-`acceleration_ratio: 20.0` remain active. The Cartesian limit is a planned reference,
+joint speed/increment limits remain in the MPC. DCP3's `velocity_ratio: 0.7` and
+`acceleration_ratio: 1.0` remain active. The Cartesian limit is a planned reference,
 not a measured TCP speed guarantee. Start by
 changing only `cartesian_max_speed` in the host-mounted YAML, validate in simulation, then restart
 MPC and measure the actual TCP response. This source/config edit does not require rebuilding the
