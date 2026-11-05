@@ -2,11 +2,11 @@
 
 공식 `neuromeka-robotics/indy-ros2`에서 Indy7에 필요한 것만 가져왔다.
 
-- 공용 로봇 모델 package: `src/indy7_description` (URDF와 visual/collision STL)
+- 공용 로봇 모델 package: `src/robot_description` (URDF와 visual/collision STL)
 - Indy7 링크의 visual/collision STL 14개
 - ROS 2 모델, MPC 계산, 실기 통신을 독립 package로 분리
 - `indy_driver`, `indy_gazebo`, `indy_moveit`, `indy_interfaces`는 복사하지 않음
-- `indy7_dcp3`: Neuromeka Python DCP3 client를 쓰는 제한된 실기 adapter
+- `robot_dcp3`: Neuromeka Python DCP3 client를 쓰는 제한된 실기 adapter
 
 Indy7은 제품명이 7이지만 실제 관절은 6개다. 기본 MPC 상태는
 `x=[q, qdot]`, 내부 최적화 입력은 URDF effort limit 안의 관절 토크 `u=tau`다.
@@ -15,14 +15,17 @@ Pinocchio ABA가 질량행렬·중력·코리올리 항을 반영해 다음 상�
 라디안 절대 관절 위치로 출력한다. 시뮬레이션에서는 이 토픽을
 `forward_position_controller`에 연결하고, 실기에서는 같은 토픽을
 IndyDCP3 `TELE_JOINT_ABSOLUTE / movetelej_abs()` adapter에 연결한다.
+`robot_mpc`는 현재 6축 모델을 지원하며, launch에서 URDF, MPC 설정, 관절 순서, 시뮬레이션
+controller 설정을 선택할 수 있다. `robot_dcp3`는 설정한 URDF와 `joint_names` 길이에 맞춰
+관절 상태와 명령을 검사한다.
 
 ## Docker 실행환경
 
 이 문서의 모든 ROS 2 명령은 Docker 컨테이너 안에서 실행한다. 호스트에서 ROS 2를
 설치하거나 `.venv`를 만들거나 `rosdep`를 실행하지 않는다. MPC image는
-[`requirements-mpc.txt`](../robots/indy7/requirements-mpc.txt)의 NumPy 2 / Pinocchio /
+[`robot-mpc.txt`](../requirements/robot-mpc.txt)의 NumPy 2 / Pinocchio /
 Crocoddyl Python stack을 사용한다. IndyDCP3 image는
-[`requirements-hardware.txt`](../robots/indy7/requirements-hardware.txt)의 Neuromeka SDK와
+[`neuromeka-dcp3.txt`](../requirements/neuromeka-dcp3.txt)의 Neuromeka SDK와
 NumPy 1 계열을 사용한다. Python ABI 충돌 방지를 위해 두 실행환경을 별도 이미지로 유지한다.
 모든 프로젝트 컨테이너와 `make run-mpc`는 `ROS_DOMAIN_ID=77`을 사용한다. 호스트에서 ROS 2
 명령을 직접 실행하는 경우에도 `export ROS_DOMAIN_ID=77`을 설정해 같은 DDS domain에 연결한다.
@@ -66,8 +69,8 @@ make docker-test
 ```bash
 make docker-run-gui
 # 컨테이너 셸 안에서
-ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=true rviz:=true plot:=true \
-  diagnostic_log_directory:=/tmp/indy7_sim_logs
+ros2 launch robot_mpc robot_mpc.launch.py simulate:=true rviz:=true plot:=true \
+  diagnostic_log_directory:=/tmp/robot_sim_logs
 ```
 
 ```bash
@@ -81,7 +84,7 @@ docker run --rm --net=host --ipc=host \
 ```bash
 docker run --rm --net=host --ipc=host \
   robot-teleoperation-framework:mpc \
-  ros2 launch indy7_mpc indy7_mpc.launch.py rviz:=false plot:=false
+  ros2 launch robot_mpc robot_mpc.launch.py rviz:=false plot:=false
 ```
 
 토픽 확인이나 로그 분석을 위해 컨테이너를 백그라운드에서 유지하려면 이름을 지정한다.
@@ -118,7 +121,7 @@ Task-space 목표는 horizon의 모든 단계에서 같은 최종 pose를 추적
 현재 TCP에서 최종 목표까지의 직선 위치 기준과 SO(3) 방향 보간 기준으로
 분해된다. 코드 parameter 기본값은 `cartesian_max_speed=0.05 m/s`,
 `cartesian_max_angular_speed=0.75 rad/s`, `cartesian_speed_margin=0.5`지만,
-실행 시 읽는 [`indy7_mpc.yaml`](src/indy7_mpc/config/indy7_mpc.yaml)이 이를
+실행 시 읽는 [`indy7_mpc.yaml`](src/robot_mpc/config/indy7_mpc.yaml)이 이를
 덮어쓴다. 현재 YAML은 각각 `0.5 m/s`, `3.0 rad/s`, `1.0`으로 설정되어 있다.
 실제 Cartesian 선속도 기준은 이 상한과 현재 방향의 Jacobian/URDF joint-velocity
 제한으로 계산한 값 중 작은 값이다. `cartesian_reference_topic`에서 현재 horizon 첫 번째 기준 pose를
@@ -127,7 +130,7 @@ RViz 설정(`config/indy7.rviz`)은 로봇 Alpha를 `0.5`로 표시하고 `tcp` 
 launch를 실행하면 `mpc_plotter`가 함께 열려 position/orientation 오차, 전체 cost, solver 성공 여부·계산시간, control norm, 최소 joint-limit 여유를 실시간으로 표시한다. 주기적 plot 갱신은 창 포커스를 반복해서 가져오지 않는다. GUI가 없는 환경에서는 `plot:=false`로 끌 수 있다.
 
 동시에 진단 로그가 기본적으로 컨테이너 내부의
-`/opt/robot_teleoperation_framework/logs/indy7_mpc/<UTC timestamp>/trace.jsonl`에 저장된다.
+`/opt/robot_teleoperation_framework/logs/robot_mpc/<UTC timestamp>/trace.jsonl`에 저장된다.
 각 줄은 한 MPC 주기의 JSON record이며 현재/목표 pose, local SE(3) 오차, q/qdot/qref,
 hard·soft joint-limit 여유, raw torque와 ABA 동역학 항, cost 항, solver 결과, TCP Jacobian의
 singular value/condition number, 월드 Z 회전에 필요한 추정 qdot, teleop pose 갱신 주기와
@@ -170,8 +173,8 @@ docker run -d --name robot-teleoperation --net=host --ipc=host \
 docker exec robot-teleoperation bash -lc \
   'source /opt/ros/jazzy/setup.bash && \
    source /opt/robot_teleoperation_framework/install/setup.bash && \
-   ros2 run indy7_mpc plot_mpc_log \
-   /opt/robot_teleoperation_framework/logs/indy7_mpc/<UTC timestamp>'
+   ros2 run robot_mpc plot_mpc_log \
+   /opt/robot_teleoperation_framework/logs/robot_mpc/<UTC timestamp>'
 ```
 
 실행 디렉터리의 `plots/overview.png`, `plots/cartesian_path.png`,
@@ -192,7 +195,7 @@ cartesian_min_duration: 0.10    # 너무 짧은 목표 이동 방지 [s]
 `cartesian_max_speed`는 계획 기준의 상한이지 측정 TCP가 그 속도로 움직인다는 보장은
 아니다. 실제 선속도는 Jacobian 제한, MPC의 관절 명령 필터, DCP3의 속도·가속도
 비율에도 영향을 받는다. DCP3 adapter의 `max_joint_velocity`와 주기별 목표값
-커팅은 제거했다. [`indy7_dcp3.yaml`](src/indy7_dcp3/config/indy7_dcp3.yaml)의
+커팅은 제거했다. [`indy7_dcp3.yaml`](src/robot_dcp3/config/indy7_dcp3.yaml)의
 `velocity_ratio`와 `acceleration_ratio`는 각각 20%이며 TCP 선속도 단위가 아니다.
 
 끝단 선속도를 더 높이는 실험은 먼저 시뮬레이션에서 확인하고, 실기에서는 작업공간을
@@ -239,7 +242,7 @@ MPC의 running/terminal 비용에 `cartesian_path` 항(가중치 `1/tolerance²`
 docker exec -it robot-teleoperation bash -lc \
   'source /opt/ros/jazzy/setup.bash && \
    source /opt/robot_teleoperation_framework/install/setup.bash && \
-   ros2 run indy7_mpc keyboard_teleop'
+   ros2 run robot_mpc keyboard_teleop'
 ```
 
 `w/s`, `a/d`, `r/f`는 각각 world 기준 x/y/z 이동이고, `u/o`, `i/k`, `j/l`은 roll/pitch/yaw 회전이다. `space`는 초기 pose로 복귀하고 `q`는 종료한다. 기본 이동량은 1 cm, 회전량은 5 deg이며 ROS parameter로 조절할 수 있다.
@@ -284,13 +287,13 @@ docker exec robot-teleoperation bash -lc \
 
 ```bash
 mkdir -p .docker-data
-cp ros2_ws/src/indy7_mpc/config/indy7_mpc.yaml \
+cp ros2_ws/src/robot_mpc/config/indy7_mpc.yaml \
   .docker-data/my_experiment.yaml
 # my_experiment.yaml의 goal_position/goal_orientation_xyzw와 가중치를 수정
 docker run --rm --net=host --ipc=host \
   -v "$PWD/.docker-data/my_experiment.yaml:/tmp/my_experiment.yaml:ro" \
   robot-teleoperation-framework:mpc \
-  ros2 launch indy7_mpc indy7_mpc.launch.py \
+  ros2 launch robot_mpc robot_mpc.launch.py \
   config_file:=/tmp/my_experiment.yaml
 ```
 
@@ -329,7 +332,7 @@ goal 근처에서 떨리면 `velocity_cost_weight`, `torque_cost_weight`,
 연결하기 전에는 반드시 별도의 position/velocity/acceleration 제한과
 안전 정지를 추가해야 한다.
 
-기본 다섯 항의 계산과 미분은 [`se3_dynamic_model.py`](src/indy7_mpc/indy7_mpc/se3_dynamic_model.py)에 있다. 실험별 weight는 YAML에서 바꾸고,
+기본 다섯 항의 계산과 미분은 [`se3_dynamic_model.py`](src/robot_mpc/robot_mpc/se3_dynamic_model.py)에 있다. 실험별 weight는 YAML에서 바꾸고,
 새 residual을 추가할 때는 이 action model의 `_terms()`와 `calcDiff()`를
 함께 수정해야 한다. `custom_costs.py`는 기존 실험과의 호환을 위해 남겨둔
 확장 지점이다. URDF task frame 이름은 `tcp`다. Teleoperation pose 자체는
@@ -340,7 +343,7 @@ goal 근처에서 떨리면 `velocity_cost_weight`, `torque_cost_weight`,
 ```bash
 docker run --rm --net=host --ipc=host \
   robot-teleoperation-framework:mpc \
-  ros2 launch indy7_mpc indy7_mpc.launch.py \
+  ros2 launch robot_mpc robot_mpc.launch.py \
   simulate:=false rviz:=false plot:=false
 ```
 
@@ -368,7 +371,7 @@ make docker-test
 이 명령은 ROS 노드를 launch하지 않으며, 로봇을 arm하거나 움직이지 않는다.
 
 ```bash
-make docker-up-indy7 ROBOT_IP=controller-address
+make docker-up-robot ROBOT_IP=controller-address
 ```
 
 별도 터미널에서 서비스별 shell을 열고 노드를 직접 실행한다. ROS, Python 환경, 마운트된
@@ -379,26 +382,26 @@ make docker-up-indy7 ROBOT_IP=controller-address
 터미널 1에서 DCP3 adapter를 실행한다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
-ros2 launch indy7_dcp3 indy7_real_teleop.launch.py robot_ip:=$INDY7_ROBOT_IP
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=dcp3
+ros2 launch robot_dcp3 robot_dcp3.launch.py robot_ip:=$ROBOT_IP
 ```
 
 터미널 2에서 실기 MPC, RViz, 진단 plot을 실행한다. MPC 목표는 첫 실측 상태의 현재 TCP
 자세로 초기화된다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
-ros2 launch indy7_mpc indy7_mpc.launch.py simulate:=false \
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=mpc
+ros2 launch robot_mpc robot_mpc.launch.py simulate:=false \
   initialize_target_from_current_state:=true rviz:=true plot:=true \
-  diagnostic_log_directory:=/tmp/indy7_mpc_logs
+  diagnostic_log_directory:=/tmp/robot_mpc_logs
 ```
 
 터미널 3에서 키보드 입력을 현재 TCP 자세에 동기화해 실행한다. 측정 자세는 최초 한 번만
 목표에 복사되며, 이후 목표는 키 입력 때만 갱신된다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
-ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=mpc
+ros2 run robot_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=true
 ```
 
 터미널 4에서 deadman heartbeat를 발행한다. 10 Hz로 계속 발행해야 하므로 이 명령은
@@ -406,8 +409,8 @@ ros2 run indy7_mpc keyboard_teleop --ros-args -p initialize_from_current_pose:=t
 disarm 절차를 수행한다. 이 ROS heartbeat는 물리 deadman이나 E-stop이 아니다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
-ros2 topic pub -r 10 /indy7_dcp3/deadman std_msgs/msg/Bool "{data: true}"
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=dcp3
+ros2 topic pub -r 10 /robot_dcp3/deadman std_msgs/msg/Bool "{data: true}"
 ```
 
 arm 전에는 별도 확인 shell에서 실제 관절 feedback, 현재 TCP, MPC command/목표를 확인한다.
@@ -415,13 +418,13 @@ arm 전에는 별도 확인 shell에서 실제 관절 feedback, 현재 TCP, MPC 
 확인하고 물리 E-stop에 즉시 접근할 수 있어야 한다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=dcp3
 ros2 topic echo /joint_states --once
-ros2 topic echo /indy7_dcp3/deadman --once
+ros2 topic echo /robot_dcp3/deadman --once
 ```
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=mpc
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=mpc
 ros2 topic echo /mpc/current_pose --once
 ros2 topic echo /mpc/desired_pose --once
 ros2 topic echo /mpc/joint_position_cmd --once
@@ -432,8 +435,8 @@ command가 최신이고, deadman이 살아 있으며, 로봇이 IDLE이고 목�
 수락된다. arm 이후부터 MPC의 절대 관절 목표가 실제 로봇에 전달된다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
-ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: true}"
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=dcp3
+ros2 service call /robot_dcp3/arm std_srvs/srv/SetBool "{data: true}"
 ```
 
 정상 종료는 **다른 DCP3 shell에서 먼저 명시적으로 disarm**한 뒤 각 launch와 keyboard
@@ -442,12 +445,12 @@ idle 컨테이너를 종료한다. deadman을 끊으면 watchdog도 정지시키
 그것을 disarm 명령 대신 사용하지 않는다.
 
 ```bash
-make docker-shell-indy7 ROBOT_IP=192.168.0.110 INDY7_SERVICE=dcp3
-ros2 service call /indy7_dcp3/arm std_srvs/srv/SetBool "{data: false}"
+make docker-shell-robot ROBOT_IP=192.168.0.110 ROBOT_SERVICE=dcp3
+ros2 service call /robot_dcp3/arm std_srvs/srv/SetBool "{data: false}"
 ```
 
 ```bash
-make docker-down-indy7
+make docker-down-robot
 ```
 
 현재 MPC YAML의 `cartesian_max_speed`는 `0.5 m/s`이고, DCP3 피드백·명령 주기는

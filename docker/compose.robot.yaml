@@ -1,0 +1,36 @@
+services:
+  mpc:
+    image: ${ROBOT_TELEOP_MPC_IMAGE:-robot-teleoperation-framework:mpc-gui}
+    user: "${LOCAL_UID:-0}:${LOCAL_GID:-0}"
+    network_mode: host
+    ipc: host
+    environment:
+      HOME: /tmp
+      ROS_DOMAIN_ID: "77"
+      DISPLAY: ${DISPLAY:-}
+      XAUTHORITY: /tmp/.Xauthority
+      QT_X11_NO_MITSHM: "1"
+    volumes:
+      - ../:/workspace:ro
+      - ../.docker-data/robot-mpc:/var/lib/robot-teleoperation-dev
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY_FILE:-${XAUTHORITY:-${HOME}/.Xauthority}}:/tmp/.Xauthority:ro
+    command:
+      - sleep
+      - infinity
+
+  dcp3:
+    image: ${ROBOT_DCP3_IMAGE:-robot-teleoperation-framework:dcp3}
+    user: "${LOCAL_UID:-0}:${LOCAL_GID:-0}"
+    network_mode: host
+    ipc: host
+    environment:
+      HOME: /tmp
+      ROS_DOMAIN_ID: "77"
+      ROBOT_IP: ${ROBOT_IP:?Set ROBOT_IP to the robot controller address}
+    volumes:
+      - ../:/workspace:ro
+      - ../.docker-data/robot-dcp3:/var/lib/robot-teleoperation-dev
+    command:
+      - sleep
+      - infinity
