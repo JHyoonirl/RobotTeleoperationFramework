@@ -1,6 +1,7 @@
 """Cartesian segment geometry and the revolute-arm command boundary (metres)."""
 
 import numpy as np
+from scipy.optimize import lsq_linear
 
 
 def smooth_path_progress(alpha, ramp_fraction):
@@ -24,7 +25,7 @@ def segment_error(position, start, goal):
     if length_squared <= 1.0e-24:
         return offset, np.eye(3)
     progress = float(offset @ direction) / length_squared
-    residual = offset - np.clip(progress, 0.0, 1.0) * direction
+    residual = offset - min(1.0, max(0.0, progress)) * direction
     projection = np.eye(3)
     if 0.0 < progress < 1.0:
         projection -= np.outer(direction, direction) / length_squared
@@ -34,32 +35,75 @@ def segment_error(position, start, goal):
 def project_cartesian_command(command, lower, upper, tcp_position, tcp_jacobian,
                               start, goal, tolerance):
     """Move a clipped command toward the line without relaxing joint bounds."""
-    command = command.copy()
+    return project_cartesian_tasks(
+        command, lower, upper, [(tcp_position, tcp_jacobian, start, goal)], tolerance
+    )
+
+
+def project_cartesian_tasks(command, lower, upper, tasks, tolerance, *, measured_q=None):
+    """Project jointly onto hand paths using only free joints inside q/rate bounds.
+
+    Each task is (position(q), jacobian(q), segment_start, segment_goal).
+    Infeasible paths can leave a residual; callers must certify the final step.
+    """
+    command = np.clip(np.asarray(command, dtype=float), lower, upper)
+    if not tasks:
+        return command
+
+    def residuals(q):
+        return [segment_error(position(q), start, goal)
+                for position, _jacobian, start, goal in tasks]
+
+    inward_constraints = []
+    if measured_q is not None:
+        measured_q = np.asarray(measured_q, dtype=float)
+        for task, (error, projection) in zip(tasks, residuals(measured_q)):
+            distance = float(np.linalg.norm(error))
+            if distance > 0.75 * tolerance:
+                normal = error @ projection @ task[1](measured_q) / distance
+                inward = 0.25 * (distance - 0.5 * tolerance)
+                inward_constraints.append((normal, inward))
+
+    def errors(q, paths):
+        # An endpoint can be inside the tube while the initial direction goes
+        # outward. Give the projection room to turn inward before backtracking.
+        inward = [max(float(normal @ (q - measured_q)) + margin, 0.0)
+                  for normal, margin in inward_constraints]
+        return np.r_[np.concatenate([path[0] for path in paths]), inward]
+
     for _ in range(12):
-        error, projection = segment_error(tcp_position(command), start, goal)
-        error_norm = float(np.linalg.norm(error))
-        if error_norm <= 0.5 * tolerance:
+        paths = residuals(command)
+        error = errors(command, paths)
+        if (max(np.linalg.norm(path[0]) for path in paths) <= 0.5 * tolerance
+                and np.max(error[3 * len(tasks):], initial=0.0) <= 1e-8):
             break
-        jacobian = projection @ tcp_jacobian(command)
+        jacobian = np.vstack([path[1] @ task[1](command)
+                              for task, path in zip(tasks, paths)])
+        if inward_constraints:
+            jacobian = np.vstack([jacobian, *[
+                normal if value > 0.0 else np.zeros_like(normal)
+                for (normal, _margin), value in zip(inward_constraints, error[3 * len(tasks):])
+            ]])
         if not np.all(np.isfinite(error)) or not np.all(np.isfinite(jacobian)):
             break
-        # Solve again on free joints when a position/rate bound blocks correction.
-        free = np.ones(command.size, dtype=bool)
-        for _ in range(command.size):
-            active_jacobian = jacobian[:, free]
-            correction = np.zeros(command.size)
-            correction[free] = -active_jacobian.T @ np.linalg.solve(
-                active_jacobian @ active_jacobian.T + 1e-8 * np.eye(3), error
-            )
-            blocked = ((command <= lower + 1e-12) & (correction < 0)) | (
-                (command >= upper - 1e-12) & (correction > 0)
-            )
-            if not np.any(blocked & free):
-                break
-            free[blocked] = False
+        error_norm = float(np.linalg.norm(error))
+        # Solve with the actual box bounds. Permanently deleting joints whose
+        # first unconstrained correction points outward can discard a feasible
+        # combination once other joints reach their bounds.
+        free = upper - lower > 1e-12
+        if not np.any(free):
+            break
+        correction = np.zeros(command.size)
+        count = int(np.sum(free))
+        correction[free] = lsq_linear(
+            np.vstack([jacobian[:, free], 1e-4 * np.eye(count)]),
+            np.r_[-error, np.zeros(count)],
+            bounds=((lower - command)[free], (upper - command)[free]),
+            method="bvls", tol=1e-8, max_iter=2 * count,
+        ).x
         for scale in (1.0, 0.5, 0.25, 0.125):
             candidate = np.clip(command + scale * correction, lower, upper)
-            candidate_error = np.linalg.norm(segment_error(tcp_position(candidate), start, goal)[0])
+            candidate_error = np.linalg.norm(errors(candidate, residuals(candidate)))
             if candidate_error < error_norm:
                 command = candidate
                 break
@@ -68,7 +112,8 @@ def project_cartesian_command(command, lower, upper, tcp_position, tcp_jacobian,
     return command
 
 
-def limit_cartesian_step(measured_q, command, tcp_position, start, goal, tolerance, reach):
+def limit_cartesian_step(measured_q, command, tcp_position, start, goal, tolerance, reach,
+                         *, allow_recovery=False):
     """Backtrack until the entire joint-linear step fits inside the path tube.
 
     For a revolute chain, ||d²p/ds²|| <= reach * sum(abs(delta_q))².
@@ -82,20 +127,31 @@ def limit_cartesian_step(measured_q, command, tcp_position, start, goal, toleran
         return float(np.linalg.norm(segment_error(position, start, goal)[0]))
 
     initial_deviation = deviation(measured_q)
-    # An external tracking error cannot be undone by certifying a new step.
-    if initial_deviation > tolerance:
+    # An external tracking error cannot be certified inside the tube. A caller
+    # may instead accept only steps that shrink the existing error.
+    recovering = initial_deviation > tolerance
+    if recovering and not allow_recovery:
         return measured_q.copy(), 0.0
     delta = command - measured_q
     for attempt in range(13):
         scale = 0.5 ** attempt
         step = scale * delta
-        curvature_margin = reach * float(np.sum(np.abs(step))) ** 2 / (8.0 * 4**2)
+        curvature = reach * float(np.sum(np.abs(step))) ** 2 / (2.0 * 4**2)
         previous = initial_deviation
         for fraction in (0.25, 0.5, 0.75, 1.0):
             current = deviation(measured_q + fraction * step)
-            if max(previous, current) + curvature_margin > tolerance:
+            # The chord-error envelope vanishes at each known endpoint, so a
+            # point exactly on the tube boundary can still move inward.
+            if curvature > 0.0:
+                peak = float(np.clip(0.5 + (current - previous) / (2.0 * curvature), 0.0, 1.0))
+                bound = previous + peak * (current - previous) + curvature * peak * (1.0 - peak)
+            else:
+                bound = max(previous, current)
+            if not np.isfinite(bound) or bound > (initial_deviation + 1e-9 if recovering else tolerance):
                 break
             previous = current
         else:
+            if recovering and previous >= initial_deviation - 1e-9:
+                continue
             return measured_q + step, scale
     return measured_q.copy(), 0.0

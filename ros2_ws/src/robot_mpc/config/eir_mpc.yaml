@@ -1,0 +1,57 @@
+# Right EIR arm; eir_left_mpc.yaml is the mirrored single-arm configuration.
+# Project simulation ready pose, not a manufacturer-calibrated home.
+crocoddyl_mpc:
+  ros__parameters:
+    control_mode: task_space
+    task_frame: right_hand_tcp
+    vive_hand_frame: right_hand_tcp
+    pose_frame: world
+    joint_names: [Joint_L2_R, Joint_L3_R, Joint_L4_R, Joint_L5_R, Joint_L6_R, Joint_L7_R, Joint_L8_R]
+    joint_command_topic: mpc/joint_position_cmd
+    teleop_pose_topic: teleop/target_pose
+    command_pose_topic: mpc/command_pose
+    goal: [0.523598775598, 1.047197551197, 0.0, 0.785398163397, 0.0, 0.0, 0.0]
+    nominal_posture: [0.523598775598, 1.047197551197, 0.0, 0.785398163397, 0.0, 0.0, 0.0]
+    goal_position: [0.0, 0.0, 1.2]
+    goal_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+    initialize_target_from_current_state: true
+    start_paused: true
+    simulate: true
+    internal_simulation: false
+    teleop_input_mode: keyboard
+    horizon: 10
+    dt: 0.01
+    max_solver_iterations: 7
+    joint_state_timeout: 0.5
+    se3_position_cost_weight: 15000.0
+    se3_orientation_cost_weight: 1500.0
+    posture_cost_weight: 0.05
+    velocity_cost_weight: 0.10
+    torque_cost_weight: 0.0001
+    joint_limit_cost_weight: 0.1
+    running_cost_weight: 1.0
+    terminal_cost_weight: 10.0
+    joint_limit_margin: 0.1
+    torque_limits: [108.0, 108.0, 66.0, 66.0, 19.0, 19.0, 19.0]
+    command_velocity_limits: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    command_increment_limits: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02]
+    command_smoothing_factor: 0.75
+    diagnostic_acceleration_clip: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+    workspace_floor_enabled: true
+    workspace_min_z: 0.15
+    workspace_floor_margin: 0.001
+    workspace_floor_cost_weight: 1000000.0
+    cartesian_max_speed: 0.2
+    cartesian_max_angular_speed: 1.0
+    cartesian_speed_margin: 1.0
+    cartesian_min_duration: 0.10
+    cartesian_path_tolerance: 0.005
+    pose_velocity_feedforward_enabled: false
+    diagnostic_ik_enabled: false
+    diagnostic_logging: true
+    diagnostic_rate: 10.0
+    diagnostic_log_prediction: false
+    stationary_hold_position_tolerance: 0.002
+    stationary_hold_orientation_tolerance: 0.01
+    stationary_hold_velocity_tolerance: 0.03
+    stationary_hold_duration: 0.10

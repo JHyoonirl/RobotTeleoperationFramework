@@ -50,6 +50,33 @@ def test_invalid_weight_is_rejected_without_settings(tmp_path):
         load_runtime_cost_settings(config)
 
 
+def test_optional_torso_weights_are_loaded(tmp_path):
+    config = tmp_path / "mpc.yaml"
+    _write_config(config, torso_cost_weight=1., torso_pitch_cost_weight=150.)
+    settings = load_runtime_cost_settings(config)
+    assert settings["torso_cost_weight"] == 1.
+    assert settings["torso_pitch_cost_weight"] == 150.
+
+
+def test_soft_path_weight_is_loaded_and_applied_to_existing_models(tmp_path):
+    config = tmp_path / 'mpc.yaml'
+    _write_config(config, cartesian_path_cost_weight=250000.)
+    settings = load_runtime_cost_settings(config)
+    running = [SimpleNamespace(weights={}, path_weight=2500.) for _ in range(2)]
+    terminal = SimpleNamespace(weights={}, path_weight=2500.)
+    apply_runtime_cost_settings(running, terminal, settings)
+    assert all(action.path_weight == 250000. for action in [*running, terminal])
+
+
+@pytest.mark.parametrize("name", ["torso_cost_weight", "torso_pitch_cost_weight", "cartesian_path_cost_weight"])
+@pytest.mark.parametrize("value", [0., -1., float("nan"), float("inf"), "bad"])
+def test_invalid_optional_weight_rejects_the_entire_update(tmp_path, name, value):
+    config = tmp_path / "mpc.yaml"
+    _write_config(config, **{name: value})
+    with pytest.raises(ValueError, match=name):
+        load_runtime_cost_settings(config)
+
+
 def test_runtime_settings_update_existing_action_models():
     running = [
         SimpleNamespace(weights={"posture": 0.05}, nominal_posture=[], terminal_scale=1.0)

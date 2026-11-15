@@ -9,10 +9,10 @@ from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
 
-def _launch_rviz(context, default_config):
+def _launch_rviz(context):
     config = Path(LaunchConfiguration("rviz_config").perform(context)).expanduser()
     if not config.exists():
-        contents = Path(default_config).read_bytes()
+        contents = Path(LaunchConfiguration("rviz_config_file").perform(context)).read_bytes()
         config.parent.mkdir(parents=True, exist_ok=True)
         try:
             with config.open("xb") as stream:
@@ -50,7 +50,7 @@ def generate_launch_description():
     def mpc_node(*, condition, remappings):
         return Node(
             package="robot_mpc",
-            executable="crocoddyl_mpc_node",
+            executable=LaunchConfiguration("mpc_executable"),
             name="crocoddyl_mpc",
             parameters=[
                 config_file,
@@ -62,6 +62,7 @@ def generate_launch_description():
                     "initialize_target_from_current_state": initialize_target_from_current_state,
                     "start_paused": LaunchConfiguration("mpc_start_paused"),
                     "enable_vive_follow": LaunchConfiguration("vive_mapping"),
+                    "vive_hand_frame": LaunchConfiguration("vive_hand_frame"),
                     "diagnostic_log_directory": diagnostic_log_directory,
                 },
             ],
@@ -75,6 +76,10 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "mpc_executable", default_value="crocoddyl_mpc_node",
+                description="MPC implementation for the selected robot",
+            ),
             DeclareLaunchArgument(
                 "config_file",
                 default_value=str(share / "config" / "indy7_mpc.yaml"),
@@ -155,6 +160,10 @@ def generate_launch_description():
                 description="Wait for F7 before running the simulation MPC",
             ),
             DeclareLaunchArgument(
+                "vive_hand_frame", default_value="hand_tcp",
+                description="Controlled hand frame for mapped or keyboard targets",
+            ),
+            DeclareLaunchArgument(
                 "vive_input_pose_topic", default_value="/tracker/right/pose",
                 description="Vive hand PoseStamped input for the mapper",
             ),
@@ -231,13 +240,13 @@ def generate_launch_description():
                 name="robot_vive_mapper",
                 condition=IfCondition(LaunchConfiguration("vive_mapping")),
                 parameters=[str(share / "config" / "indy7_vive_mapping.yaml"),
-                            {"input_pose_topic": LaunchConfiguration("vive_input_pose_topic")}],
+                            {"input_pose_topic": LaunchConfiguration("vive_input_pose_topic"),
+                             "hand_frame": LaunchConfiguration("vive_hand_frame")}],
                 additional_env={"FASTDDS_BUILTIN_TRANSPORTS": "UDPv4"},
                 output="screen",
             ),
             OpaqueFunction(
                 function=_launch_rviz,
-                kwargs={"default_config": str(share / "config" / "indy7.rviz")},
                 condition=IfCondition(rviz),
             ),
             Node(

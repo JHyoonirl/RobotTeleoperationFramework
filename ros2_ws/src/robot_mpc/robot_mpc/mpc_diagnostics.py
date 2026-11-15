@@ -11,6 +11,9 @@ import numpy as np
 
 
 class MpcDiagnosticsMixin:
+    def _extra_diagnostic_record(self, state):
+        return {}
+
     def _open_diagnostic_log(self, urdf_path: Path) -> None:
         """Create one self-contained JSONL trace and a parameter snapshot."""
         if not self.diagnostic_logging:
@@ -66,6 +69,8 @@ class MpcDiagnosticsMixin:
                 "cartesian_speed_margin",
                 "cartesian_min_duration",
                 "cartesian_path_tolerance",
+                "cartesian_path_cost_weight",
+                "cartesian_path_limit_enabled",
                 "cartesian_reference_topic",
                 "pose_velocity_feedforward_enabled",
                 "pose_velocity_feedforward_gain",
@@ -84,6 +89,8 @@ class MpcDiagnosticsMixin:
                 "terminal_cost_weight",
                 "joint_limit_margin",
                 "torque_limits",
+                "prediction_model",
+                "acceleration_limits",
                 "diagnostic_acceleration_clip",
                 "ik_max_iterations",
                 "ik_damping",
@@ -322,7 +329,9 @@ class MpcDiagnosticsMixin:
                     "prediction_guard": prediction_guard,
                 },
                 "control": {
-                    "raw_torque": raw_control,
+                    "prediction_model": getattr(self, "prediction_model", "rigid_body"),
+                    "raw_torque": (None if getattr(self, "prediction_model", "rigid_body") == "joint_acceleration"
+                                   else raw_control),
                     # Legacy name retained so old analysis scripts still load.
                     "raw_qddot": raw_control,
                     "raw_norm": float(np.linalg.norm(raw_control))
@@ -331,6 +340,7 @@ class MpcDiagnosticsMixin:
                     "command_boundary": "joint_position",
                     "applied_torque": None,
                     "acceleration_limit_enforced": False,
+                    "prediction_acceleration_limit_enforced": getattr(self, "prediction_model", "rigid_body") == "joint_acceleration",
                     "diagnostic_acceleration_clip": self.last_target_acceleration,
                     # Kept for existing trace readers; this value is diagnostic only.
                     "target_qddot_after_clip": self.last_target_acceleration,
@@ -344,6 +354,7 @@ class MpcDiagnosticsMixin:
                 "predicted_next_state": predicted_next_state,
                 "applied_state": applied_state,
             }
+            record.update(self._extra_diagnostic_record(state))
             if self.diagnostic_log_prediction:
                 record["prediction"] = {
                     "xs": [np.asarray(item, dtype=float) for item in self.xs],

@@ -11,6 +11,7 @@ from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Float64, String
 
@@ -42,10 +43,12 @@ class MpcPlotter(Node):
                 "posture",
                 "velocity",
                 "torque",
+                "acceleration",
                 "joint_limit",
                 "terminal_cost",
                 "solve_time_ms",
                 "callback_time_ms",
+                "command_period_ms",
                 "solver_iterations",
                 "solver_success",
                 "control_norm",
@@ -54,6 +57,7 @@ class MpcPlotter(Node):
         }
         self.latest = {name: float("nan") for name in self.history}
         self.latest_status = ""
+        self.model_dt = float("nan")
         self.joint_names = [str(name) for name in self.get_parameter("joint_names").value]
         if not self.joint_names or len(set(self.joint_names)) != len(self.joint_names):
             raise ValueError("joint_names must contain unique joint names")
@@ -71,10 +75,12 @@ class MpcPlotter(Node):
             "posture": "/mpc/cost/posture",
             "velocity": "/mpc/cost/velocity",
             "torque": "/mpc/cost/torque",
+            "acceleration": "/mpc/cost/acceleration",
             "joint_limit": "/mpc/cost/joint_limit",
             "terminal_cost": "/mpc/terminal_cost",
             "solve_time_ms": "/mpc/solve_time_ms",
             "callback_time_ms": "/mpc/callback_time_ms",
+            "command_period_ms": "/mpc/command_period_ms",
             "solver_iterations": "/mpc/solver_iterations",
             "solver_success": "/mpc/solver_success",
             "control_norm": "/mpc/control_norm",
@@ -87,6 +93,12 @@ class MpcPlotter(Node):
                 10,
             )
         self.create_subscription(JointState, "/joint_states", self._on_joint_state, 10)
+        self.create_subscription(
+            Float64,
+            "/mpc/model_dt",
+            self._on_model_dt,
+            QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+        )
         self.create_subscription(String, "/mpc/status", self._on_status, 10)
 
         try:
@@ -114,9 +126,10 @@ class MpcPlotter(Node):
             "cost": self.ax_cost.plot([], [], label="total cost", color="tab:red")[0],
             "solve_time_ms": self.ax_solver.plot([], [], label="solve time [ms]", color="tab:purple")[0],
             "callback_time_ms": self.ax_solver.plot([], [], label="callback time [ms]", color="tab:red")[0],
+            "command_period_ms": self.ax_solver.plot([], [], label="command period [ms]", color="tab:orange")[0],
             "solver_iterations": self.ax_iterations.plot([], [], label="iterations", color="tab:green")[0],
             "solver_success": self.ax_success.plot([], [], label="success", color="tab:cyan", drawstyle="steps-post")[0],
-            "control_norm": self.ax_control.plot([], [], label="|tau|", color="tab:brown")[0],
+            "control_norm": self.ax_control.plot([], [], label="|u|", color="tab:brown")[0],
             "joint_limit_margin": self.ax_margin.plot([], [], label="min joint margin [rad]", color="tab:pink")[0],
         }
         cost_colors = {
@@ -125,6 +138,7 @@ class MpcPlotter(Node):
             "posture": "tab:olive",
             "velocity": "tab:cyan",
             "torque": "tab:purple",
+            "acceleration": "tab:blue",
             "joint_limit": "tab:pink",
             "terminal_cost": "tab:gray",
         }
@@ -206,6 +220,11 @@ class MpcPlotter(Node):
         )
         self._record("joint_limit_margin", margin)
 
+    def _on_model_dt(self, message: Float64) -> None:
+        value = float(message.data)
+        if math.isfinite(value) and value > 0.0:
+            self.model_dt = value
+
     @staticmethod
     def _refresh_legend(*axes) -> None:
         handles, labels = [], []
@@ -248,11 +267,26 @@ class MpcPlotter(Node):
             axis.autoscale_view()
         self.ax_success.set_ylim(-0.05, 1.05)
         status, color = self._status_label(self.latest_status, self.latest["solver_success"])
+        command_period = self.latest["command_period_ms"]
+        command_rate = (
+            1.0e3 / command_period
+            if math.isfinite(command_period) and command_period > 0
+            else float("nan")
+        )
+        command_label = (
+            f"command Δt={command_period:.1f} ms / {command_rate:.1f} Hz"
+            if math.isfinite(command_rate) else "cmd=waiting"
+        )
+        model_label = (
+            f"MPC dt={1.0e3 * self.model_dt:.1f} ms / {1.0 / self.model_dt:.1f} Hz"
+            if math.isfinite(self.model_dt) else "MPC dt=waiting"
+        )
         self.figure.suptitle(
             f"Robot MPC | {status} | "
             f"pos={self.latest['position_error']:.4g} m | "
             f"ori={math.degrees(self.latest['orientation_error']):.3g} deg | "
-            f"margin={self.latest['joint_limit_margin']:.3g} rad",
+            f"margin={self.latest['joint_limit_margin']:.3g} rad | "
+            f"{model_label} | {command_label}",
             color=color,
         )
         self.figure.canvas.draw_idle()

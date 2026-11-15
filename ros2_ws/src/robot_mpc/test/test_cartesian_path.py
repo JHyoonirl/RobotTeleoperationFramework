@@ -67,6 +67,18 @@ def test_safe_endpoints_do_not_allow_a_curved_step_outside_the_tube():
     assert max(deviations) <= 0.0025
 
 
+def test_inward_step_from_exact_tube_boundary_is_not_blocked():
+    tolerance = 0.005
+    position = lambda q: np.array([0.1, tolerance - q[0], 0.0])
+    measured, proposed = np.array([0.0]), np.array([0.001])
+    command, scale = limit_cartesian_step(
+        measured, proposed, position, np.zeros(3), np.array([0.2, 0, 0]),
+        tolerance, 1.0,
+    )
+    assert scale == 1.0
+    assert command[0] == proposed[0]
+
+
 def test_non_finite_kinematics_fails_closed():
     command, scale = limit_cartesian_step(
         np.zeros(1), np.ones(1), lambda q: np.full(3, np.nan),
@@ -85,6 +97,9 @@ def node():
     node.model, node.state = model, crocoddyl.StateMultibody(model)
     node.frame_id, node.pose_data = model.getFrameId("tcp"), model.createData()
     node.control_mode = "task_space"
+    node.prediction_model = "rigid_body"
+    node.acceleration_limits = None
+    node.cartesian_path_limit_enabled = True
     node.simulate = True
     node.execution_enabled = True
     node.vive_control = None
@@ -103,6 +118,7 @@ def node():
     node.command_increment_limits = np.full(6, 0.02)
     node.command_smoothing_factor = 0.75
     node.cartesian_path_tolerance = 0.0025
+    node.cartesian_path_cost_weight = 1.0 / node.cartesian_path_tolerance**2
     node.cartesian_max_speed = 0.5
     node.cartesian_max_angular_speed = 3.0
     node.pose_velocity_feedforward_enabled = True
@@ -155,6 +171,17 @@ def test_joint_mode_keeps_existing_command_limits(node):
     command = node._safe_joint_command(node.sim_q + 0.5, state)
     np.testing.assert_allclose(command, node.sim_q + 0.02)
     assert node.cartesian_command_scale == 1.0
+
+
+def test_soft_path_command_slowdown_preserves_the_mpc_joint_direction(node):
+    node.cartesian_path_limit_enabled = False
+    node.command_smoothing_factor = 1.
+    node.last_q_cmd = node.sim_q.copy()
+    node.command_increment_limits[0] = .001
+    delta = np.array([.04, .02, -.01, .005, -.008, .012])
+    command = node._safe_joint_command(node.sim_q + delta, np.r_[node.sim_q, np.zeros(6)])
+    np.testing.assert_allclose(command - node.sim_q, .025 * delta, atol=1e-12)
+    assert node.cartesian_path_guard == ""
 
 
 def test_position_smoothing_preserves_planned_constant_velocity(node):

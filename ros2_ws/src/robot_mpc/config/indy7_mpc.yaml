@@ -41,7 +41,7 @@ crocoddyl_mpc:
     # Track the generated path velocity; zero is used only after the path ends.
     velocity_cost_weight: 0.10
     torque_cost_weight: 0.0001
-    joint_limit_cost_weight: 10.0
+    joint_limit_cost_weight: 0.1
     running_cost_weight: 1.0
     terminal_cost_weight: 10.0
     nominal_posture: [0.0, 0.0, -1.57, 0.0, -1.57, 0.0]

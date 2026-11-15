@@ -57,7 +57,8 @@ class ViveMappingPanel(QGroupBox):
         self.mode_combo.activated.connect(self.select_mode)
         source_row.addWidget(self.mode_combo)
         source_row.addStretch(1)
-        source_row.addWidget(QLabel("Controlled frame: hand_tcp  |  Goal: hand_target"))
+        self.controlled_frame_label = QLabel("Controlled frame: waiting  |  Goal: hand_target")
+        source_row.addWidget(self.controlled_frame_label)
         grid.addLayout(source_row, 0, 0)
         self.input_pages = QStackedWidget()
         self.topic_page = QWidget()
@@ -153,11 +154,11 @@ class ViveMappingPanel(QGroupBox):
         grid.addLayout(actions, 5, 0)
         self.result_label.setWordWrap(True)
         grid.addWidget(self.result_label, 6, 0)
-        note = QLabel("Edit hand_target with Keyboard or select a Topic Pose input. "
+        self.note = QLabel("Edit hand_target with Keyboard or select a Topic Pose input. "
                       "Hold F7 or the Run button to move. Release to pause. "
                       "F6 connects/disconnects robot teleoperation.")
-        note.setWordWrap(True)
-        grid.addWidget(note, 7, 0)
+        self.note.setWordWrap(True)
+        grid.addWidget(self.note, 7, 0)
 
         # Window scope keeps F5 active after clicking any child input/control.
         self.sync_shortcut = QShortcut(QKeySequence("F5"), shortcut_parent or self)
@@ -355,6 +356,8 @@ class ViveMappingPanel(QGroupBox):
         self.client.publish_keyboard_target()
         self.client.publish_run_hold()
         state = self.client.snapshot()
+        hand_frame = state["simulation"].get("hand_frame", "hand_tcp")
+        self.controlled_frame_label.setText(f"Controlled frame: {hand_frame}  |  Goal: hand_target")
         follow_pending = self.robot_connection is not None and self.robot_connection.follow_pending
         if self._run_source is not None and not state["run_held"] and not follow_pending:
             self._run_source = None
@@ -369,7 +372,7 @@ class ViveMappingPanel(QGroupBox):
         self.mode_combo.setEnabled(state["can_change_mode"] and not (connection and connection["lock_settings"]))
         self.input_pages.setCurrentWidget(self.keyboard_page if keyboard else self.topic_page)
         self.keyboard_page.setEnabled(state["simulation_fresh"])
-        self.keyboard_current_label.setText(_pose_text("Current hand_tcp", state["simulation_current"]))
+        self.keyboard_current_label.setText(_pose_text(f"Current {hand_frame}", state["simulation_current"]))
         keyboard_pose = state["keyboard_pose"]
         keyboard_sample = ((keyboard_pose, state["simulation"].get("world_frame", "world"), 0)
                            if keyboard_pose is not None else None)
@@ -463,13 +466,21 @@ def main(args=None):
 
     rclpy.init(args=args)
     node = TeleopRosNode("robot_vive_mapping_gui")
+    node.declare_parameter("simulation_only", False)
     client = ViveMappingClient(node)
     app = QApplication([])
     window = QMainWindow()
     window.setWindowTitle("Robot Hand Target Teleoperation")
     panel = ViveMappingPanel(client, parent=window, shortcut_parent=window)
-    connection = RobotConnection(node, client)
-    panel.attach_robot_connection(connection)
+    connection = None
+    if node.get_parameter("simulation_only").value:
+        panel.connect_button.hide()
+        panel.connect_shortcut.setEnabled(False)
+        panel.connection_label.setText("Simulation only")
+        panel.note.setText("Edit the hand target with Keyboard or Topic Pose. Hold F7 or Run to move; release to pause.")
+    else:
+        connection = RobotConnection(node, client)
+        panel.attach_robot_connection(connection)
     window.setCentralWidget(panel)
     window.resize(1000, 540)
     executor = SingleThreadedExecutor()
@@ -489,7 +500,8 @@ def main(args=None):
         result = app.exec_()
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
-        connection.close()
+        if connection is not None:
+            connection.close()
         client.close()
         executor.shutdown(timeout_sec=1.0)
         thread.join(timeout=1.0)

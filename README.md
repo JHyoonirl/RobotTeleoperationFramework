@@ -1,13 +1,13 @@
 # Robot Teleoperation Framework
 
-Neuromeka Indy7 조작 및 task-space MPC 실험을 위한 ROS 2 저장소입니다.
+Neuromeka Indy7 조작과 EIR 시뮬레이션 및 task-space MPC 실험을 위한 ROS 2 저장소입니다.
 이 저장소의 공식 사용 경로는 Docker입니다. 호스트에는 Docker Engine 또는 Docker
 Desktop만 준비하면 되며, ROS 2와 MPC 의존성은 이미지 안에 설치됩니다.
 
 기본 빌드는 Robot MPC를 사용합니다. Vive Tracker 입력과 MANUS-WUJI 손
 리타게팅은 같은 workspace에 배치된 선택형 Git submodule입니다.
 
-- `robot_description`: 공용 모델 패키지. 현재 Indy7 URDF와 mesh를 포함합니다.
+- `robot_description`: 공용 모델 패키지. Indy7·EIR URDF와 mesh를 포함합니다.
 - `robot_mpc`: Crocoddyl/Pinocchio 기반 SE(3) MPC, RViz 및 mock `ros2_control` 실행
 - `robot_dcp3`: MPC 관절 명령과 Neuromeka IndyDCP3 실기 연결
 - `requirements/robot-mpc.txt`, `requirements/neuromeka-dcp3.txt`: 공통 MPC와 DCP3 런타임 의존성
@@ -41,7 +41,7 @@ IndyDCP3 연결에는 명시적 arm 서비스, deadman/명령 timeout, URDF 관�
 ├── ros2_ws/
 │   ├── README.md
 │   └── src/
-│       ├── robot_description/     # 공용 모델 패키지 (현재 Indy7)
+│       ├── robot_description/     # 공용 모델 패키지 (Indy7, EIR)
 │       ├── robot_mpc/             # MPC 계산 패키지
 │       ├── robot_dcp3/            # IndyDCP3 실기 adapter
 │       ├── vive_tracker_ros2/     # Vive 입력 (git submodule)
@@ -129,6 +129,8 @@ Jazzy와 저장소의 `.venv`를 사용합니다. `build-hand`는 호스트 ROS/
 | `make docker-up-robot-sim` | 실제 IP 없이 MPC 시뮬레이션 컨테이너만 시작합니다. DCP3 컨테이너는 시작하지 않습니다. |
 | `make docker-launch-robot-sim` | mock ros2_control 시뮬레이션, RViz, MPC plot, teleoperation GUI를 실행합니다. |
 | `make docker-launch-robot-sim-minimal` | 기존 GUI는 유지하고, 조인트 매핑과 TCP 키보드 제어에 집중한 최소 GUI로 시뮬레이션을 실행합니다. |
+| `make docker-launch-eir-sim` | EIR 양팔 14축과 torso 2축을 함께 제어합니다. 기본 `EIR_ARM=both`, 단일 팔 `left/right`도 지원하며 ROS 도메인은 78입니다. |
+| `make docker-stop-eir-sim` | EIR 시뮬레이션 실행만 종료합니다. |
 | `make docker-keyboard-robot-sim` | 별도 터미널에서 키보드 TCP teleoperation을 실행합니다. |
 | `make docker-down-robot-sim` | simulation MPC 컨테이너를 중지합니다. |
 

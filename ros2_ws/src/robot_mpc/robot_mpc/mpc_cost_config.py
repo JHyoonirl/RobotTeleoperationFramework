@@ -18,7 +18,7 @@ WEIGHT_PARAMETERS = {
 }
 
 
-def load_runtime_cost_settings(path: str | Path) -> dict:
+def load_runtime_cost_settings(path: str | Path, *, joint_count: int = 6) -> dict:
     """Read and validate cost weights and the preferred joint posture."""
     try:
         document = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
@@ -44,20 +44,24 @@ def load_runtime_cost_settings(path: str | Path) -> dict:
         weights[action_name] = value
 
     posture = parameters.get("nominal_posture")
-    if not isinstance(posture, (tuple, list)) or len(posture) != 6:
-        raise ValueError("nominal_posture must contain six finite joint angles in radians")
+    posture_error = f"nominal_posture must contain {joint_count} finite joint angles in radians"
+    if not isinstance(posture, (tuple, list)) or len(posture) != joint_count:
+        raise ValueError(posture_error)
     nominal_posture = []
     for value in posture:
         try:
             parsed = float(value)
         except (TypeError, ValueError) as exc:
-            raise ValueError("nominal_posture must contain six finite joint angles in radians") from exc
+            raise ValueError(posture_error) from exc
         if not math.isfinite(parsed):
-            raise ValueError("nominal_posture must contain six finite joint angles in radians")
+            raise ValueError(posture_error)
         nominal_posture.append(parsed)
 
     scales = {}
-    for name in ("running_cost_weight", "terminal_cost_weight"):
+    scalar_names = ["running_cost_weight", "terminal_cost_weight"]
+    scalar_names.extend(name for name in ("torso_cost_weight", "torso_pitch_cost_weight", "cartesian_path_cost_weight")
+                        if name in parameters)
+    for name in scalar_names:
         try:
             value = float(parameters[name])
         except (KeyError, TypeError, ValueError) as exc:
@@ -79,6 +83,10 @@ def apply_runtime_cost_settings(running_actions, terminal_action, settings: dict
         action.weights.update(settings["weights"])
         action.nominal_posture = list(settings["nominal_posture"])
         action.terminal_scale = float(settings["running_cost_weight"])
+        if "cartesian_path_cost_weight" in settings:
+            action.path_weight = settings["cartesian_path_cost_weight"]
     terminal_action.weights.update(settings["weights"])
     terminal_action.nominal_posture = list(settings["nominal_posture"])
     terminal_action.terminal_scale = float(settings["terminal_cost_weight"])
+    if "cartesian_path_cost_weight" in settings:
+        terminal_action.path_weight = settings["cartesian_path_cost_weight"]

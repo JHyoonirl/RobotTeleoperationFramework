@@ -3,6 +3,9 @@
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock
+import json
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -20,7 +23,7 @@ from rclpy.context import Context
 from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, String
 from std_srvs.srv import SetBool
 from tf2_ros import TransformBroadcaster
 
@@ -32,8 +35,31 @@ from robot_mpc.pose_mapping import inverse_transform, pose_from_transform, trans
 from robot_mpc.vive_mapping_client import ViveMappingClient
 from robot_mpc.vive_mapping_gui import ViveMappingPanel
 from robot_mpc.vive_pose_mapper import VivePoseMapper
+from robot_mpc.vive_simulation_control import ViveSimulationControl
 
 pytestmark = pytest.mark.usefixtures("qapp")
+
+
+@pytest.mark.parametrize("execution_enabled,pending_alignment", [(True, None), (False, [.1] * 6)])
+def test_duplicate_f7_release_and_stop_service_reset_execution_only_once(execution_enabled, pending_alignment):
+    node = SimpleNamespace(execution_enabled=execution_enabled, _paused_alignment_target=pending_alignment)
+    def set_execution_enabled(enabled):
+        node.execution_enabled = enabled
+        node._paused_alignment_target = None
+    node._set_execution_enabled = Mock(side_effect=set_execution_enabled)
+    control = ViveSimulationControl.__new__(ViveSimulationControl)
+    control.node, control.following = node, execution_enabled
+    control._hold_token, control._hold_latched = "held-key", True
+    control._hold_received = time.monotonic()
+    control.publish_status = Mock()
+    release = String(data=json.dumps({"held": False, "token": "held-key"}))
+    control._on_hold(release)
+    control._run(SetBool.Request(data=False), SetBool.Response())
+    control._on_hold(release)
+    node._set_execution_enabled.assert_called_once_with(False)
+    assert not control.following and not node.execution_enabled
+    assert not control.hold_active()
+    assert node._paused_alignment_target is None
 
 
 def test_manual_mpc_keeps_original_tcp_frame():

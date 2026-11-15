@@ -184,6 +184,9 @@ class ViveSimulationControl:
         if node._below_workspace_floor(node.latest_state[:node.model.nq]):
             return (f"Measured {node.task_frame} is below world Z={node.workspace_min_z:.3f} m. "
                     "F7 is blocked; restore a valid starting posture before running.")
+        extra_reason = node._execution_ready_reason()
+        if extra_reason:
+            return extra_reason
         if self.input_mode == "keyboard":
             if self._keyboard_target is None:
                 return self._keyboard_error
@@ -231,8 +234,11 @@ class ViveSimulationControl:
         return response
 
     def stop(self, reason):
+        was_running = (self.following or self.node.execution_enabled
+                       or getattr(self.node, "_paused_alignment_target", None) is not None)
         self.following = False
-        self.node._set_execution_enabled(False)
+        if was_running:
+            self.node._set_execution_enabled(False)
         self.message = reason
         self.publish_status()
 

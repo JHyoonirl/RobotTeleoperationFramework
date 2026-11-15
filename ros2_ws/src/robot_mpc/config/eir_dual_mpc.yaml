@@ -1,0 +1,190 @@
+# Shared 16-axis MPC: both 7-axis arms plus torso yaw/pitch; head stays fixed.
+# Project simulation ready pose: torso 0, left [-30,-60,0,-45,0,0,0] deg,
+# right [30,60,0,45,0,0,0] deg. Not a manufacturer-calibrated home.
+crocoddyl_mpc:
+  ros__parameters:
+    control_mode: task_space
+    task_frame: right_hand_tcp
+    vive_hand_frame: right_hand_tcp
+    pose_frame: world
+    joint_names:
+    - Joint_L0
+    - Joint_L1
+    - Joint_L2_L
+    - Joint_L3_L
+    - Joint_L4_L
+    - Joint_L5_L
+    - Joint_L6_L
+    - Joint_L7_L
+    - Joint_L8_L
+    - Joint_L2_R
+    - Joint_L3_R
+    - Joint_L4_R
+    - Joint_L5_R
+    - Joint_L6_R
+    - Joint_L7_R
+    - Joint_L8_R
+    joint_command_topic: mpc/joint_position_cmd
+    teleop_pose_topic: teleop/target_pose
+    command_pose_topic: mpc/command_pose
+    goal:
+    - 0.0
+    - 0.0
+    - -0.523598775598
+    - -1.047197551197
+    - 0.0
+    - -0.785398163397
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.523598775598
+    - 1.047197551197
+    - 0.0
+    - 0.785398163397
+    - 0.0
+    - 0.0
+    - 0.0
+    nominal_posture:
+    - 0.0
+    - 0.0
+    - -0.523598775598
+    - -1.047197551197
+    - 0.0
+    - -0.785398163397
+    - 0.0
+    - 0.0
+    - 0.0
+    - 0.523598775598
+    - 1.047197551197
+    - 0.0
+    - 0.785398163397
+    - 0.0
+    - 0.0
+    - 0.0
+    goal_position:
+    - 0.0
+    - 0.0
+    - 1.2
+    goal_orientation_xyzw:
+    - 0.0
+    - 0.0
+    - 0.0
+    - 1.0
+    initialize_target_from_current_state: true
+    start_paused: true
+    simulate: true
+    internal_simulation: false
+    # Mock ros2_control accepts position commands; u is joint acceleration.
+    # Use rigid_body for ABA/total-torque prediction; this setting requires restart.
+    prediction_model: joint_acceleration
+    acceleration_limits: [40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0, 40.0]
+    teleop_input_mode: keyboard
+    horizon: 7
+    dt: 0.015
+    max_solver_iterations: 3
+    joint_state_timeout: 0.5
+    se3_position_cost_weight: 60000.0
+    se3_orientation_cost_weight: 1500.0
+    # Preserve the outward-elbow ready posture while following both hand paths.
+    posture_cost_weight: 0.05
+    velocity_cost_weight: 0.1
+    torque_cost_weight: 0.0001
+    joint_limit_cost_weight: 10.0
+    running_cost_weight: 1.0
+    terminal_cost_weight: 1.0
+    torso_cost_weight: 0.01
+    torso_pitch_cost_weight: 150.0
+    joint_limit_margin: 0.15
+    torque_limits:
+    - 50.0
+    - 50.0
+    - 108.0
+    - 108.0
+    - 66.0
+    - 66.0
+    - 19.0
+    - 19.0
+    - 19.0
+    - 108.0
+    - 108.0
+    - 66.0
+    - 66.0
+    - 19.0
+    - 19.0
+    - 19.0
+    command_velocity_limits:
+    - 0.4
+    - 0.3
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    - 1.0
+    command_increment_limits:
+    - 0.016
+    - 0.012
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    - 0.04
+    command_smoothing_factor: 0.75
+    diagnostic_acceleration_clip:
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    - 40.0
+    workspace_floor_enabled: true
+    workspace_min_z: 0.15
+    workspace_floor_margin: 0.001
+    workspace_floor_cost_weight: 1000000.0
+    cartesian_max_speed: 0.5
+    short_move_distance: 0.01
+    short_move_speed: 0.4
+    cartesian_max_angular_speed: 3.0
+    cartesian_speed_margin: 1.0
+    cartesian_min_duration: 0.1
+    cartesian_path_tolerance: 0.02
+    # Soft distance-to-segment cost [m^-2], independent of the optional hard tube.
+    cartesian_path_cost_weight: 250000.0
+    cartesian_path_limit_enabled: false
+    pose_velocity_feedforward_enabled: true
+    diagnostic_ik_enabled: false
+    diagnostic_logging: true
+    diagnostic_rate: 10.0
+    diagnostic_log_prediction: false
+    stationary_hold_position_tolerance: 0.0005
+    stationary_hold_orientation_tolerance: 0.002
+    stationary_hold_velocity_tolerance: 0.05
+    stationary_hold_duration: 0.1
+

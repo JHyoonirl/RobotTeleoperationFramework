@@ -11,6 +11,10 @@ INCLUDE_HAND ?= 0
 DOCKER_TAG := mpc
 ROBOT_SERVICE ?= mpc
 FORCE_COLCON_BUILD ?= 0
+EIR_ARM ?= both
+EIR_ROS_DOMAIN_ID ?= 78
+EIR_MPC_DIAGNOSTIC_LOG_DIRECTORY ?= /var/lib/robot-teleoperation-dev/logs/eir_mpc_diag
+ISAAC_SIM_ROOT ?= $(HOME)/isaacsim-6.0.1
 DOCKER_BASE_PATHS := /workspace/ros2_ws/src/robot_description \
 	/workspace/ros2_ws/src/robot_mpc
 DOCKER_DCP3_BASE_PATHS := /workspace/ros2_ws/src/robot_description \
@@ -183,6 +187,32 @@ docker-launch-robot-sim-minimal:
 		exec ros2 launch robot_mpc robot_mpc.launch.py simulate:=true \
 		initialize_target_from_current_state:=true rviz:=true plot:=false teleop_gui:=false teleop_minimal_gui:=true vive_mapping:=true mpc_start_paused:=true \
 		diagnostic_log_directory:=/tmp/robot_mpc_logs'
+
+.PHONY: docker-launch-eir-sim docker-stop-eir-sim
+docker-launch-eir-sim:
+	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \
+	ROBOT_DCP3_IMAGE=$(DOCKER_IMAGE):dcp3 \
+	ROBOT_IP=127.0.0.1 \
+	docker compose -f docker/compose.robot.yaml exec \
+		-e FORCE_COLCON_BUILD=$(FORCE_COLCON_BUILD) -e LIBGL_ALWAYS_SOFTWARE=1 \
+		-e ROS_DOMAIN_ID=$(EIR_ROS_DOMAIN_ID) -e ROS_LOCALHOST_ONLY=1 -e EIR_ARM="$(EIR_ARM)" mpc \
+		bash /workspace/docker/dev-shell.sh /var/lib/robot-teleoperation-dev \
+		$(DOCKER_BASE_PATHS) -- bash -lc 'exec 9>/tmp/eir_mpc_sim.lock; \
+		flock -w 8 9 || { echo "An EIR simulation launch is already active." >&2; exit 2; }; \
+		echo $$$$ >/tmp/eir_mpc_sim.pid; \
+		exec ros2 launch robot_mpc eir_sim.launch.py arm:="$$EIR_ARM" \
+		rviz_config:=/var/lib/robot-teleoperation-dev/profiles/eir-"$$EIR_ARM".rviz \
+		diagnostic_log_directory:=$(EIR_MPC_DIAGNOSTIC_LOG_DIRECTORY)'
+
+docker-stop-eir-sim:
+	ROBOT_IP=127.0.0.1 docker compose -f docker/compose.robot.yaml exec -T mpc \
+		python3 -c 'import os, pathlib, signal; saved = pathlib.Path("/tmp/eir_mpc_sim.pid"); pid = int(saved.read_text()) if saved.exists() else 0; process = pathlib.Path(f"/proc/{pid}/cmdline"); command = process.read_bytes() if process.exists() else b""; assert not command or b"eir_sim.launch.py" in command, "EIR launch PID does not match"; os.kill(pid, signal.SIGINT) if command else print("EIR simulation is already stopped")'
+
+.PHONY: isaac-eir-viewer
+isaac-eir-viewer:
+	@test -x "$(ISAAC_SIM_ROOT)/isaac-sim.sh" || { echo "Isaac Sim launcher not found: $(ISAAC_SIM_ROOT)/isaac-sim.sh" >&2; exit 2; }
+	ROS_DOMAIN_ID=$(EIR_ROS_DOMAIN_ID) ROS_LOCALHOST_ONLY=1 RMW_IMPLEMENTATION=rmw_fastrtps_cpp \
+		"$(ISAAC_SIM_ROOT)/isaac-sim.sh" --exec "$(REPO_ROOT)/isaac_sim/eir_joint_state_viewer.py"
 
 docker-keyboard-robot-sim:
 	ROBOT_TELEOP_MPC_IMAGE=$(DOCKER_IMAGE):mpc-gui \

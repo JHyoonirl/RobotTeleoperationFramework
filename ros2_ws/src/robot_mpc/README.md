@@ -1,5 +1,262 @@
 # Robot hand target teleoperation and pose mapping
 
+## EIR simulation
+
+The official EIR model is available through a separate simulation launch:
+
+```bash
+make docker-up-robot-sim
+FORCE_COLCON_BUILD=1 make docker-launch-eir-sim
+# Optional single-arm mode after stopping the EIR launch:
+make docker-stop-eir-sim
+make docker-launch-eir-sim EIR_ARM=left
+```
+
+This uses ROS domain **78**, independently of the Indy7 domain 77, and starts
+RViz plus the EIR hands GUI. **Both arms and torso are enabled by default**
+(`EIR_ARM=both`). Check **Run MPC** or hold **F7** to follow the targets; uncheck
+Run MPC or release F7 to pause. **F5** resets both hand targets to the
+current poses. Logs go to `/tmp/eir_mpc_logs` inside the MPC container.
+Run MPC stays active while switching to Isaac Sim; closing or hiding the EIR GUI
+pauses motion.
+
+The whole 18-axis robot is displayed. One shared MPC and position controller
+command the two torso joints (`Joint_L0/L1`) and both seven-axis arms together;
+the two head joints remain at their initial pose. The dual controller is configured
+for `dt=0.05`, 10 stages (500 ms preview), and at most 6 solver iterations. It
+sums both SE(3) tasks in one optimization, avoiding conflicting torso commands
+from separate arm solvers. In the centered 100 mm square test, solve-time p95
+was about 36 ms, below the configured 50 ms period.
+
+Startup uses a symmetric simulation ready pose: torso/head zero, left arm
+`[-30,-60,0,-45,0,0,0]` degrees, right arm `[30,60,0,45,0,0,0]` degrees in
+`Joint_L2` through `Joint_L8` order. Both hands start about 318 mm forward,
+639 mm apart, at 876 mm height. The URDF mock initial values, MPC goals and
+preferred postures agree. This is a project posture, not a factory Home:
+the [official EIR SRDF](https://github.com/neuromeka-robotics/indy-ros2/blob/ca0353f077620c877c1edff2e26c8cd976773f27/indy_moveit/srdf/indy_macro.srdf.xacro#L14-L43)
+only supplies all-zero arm states. The ready pose avoids their straight-arm
+singularity and passed a static nonadjacent collision-mesh check. Changing
+the initial values takes effect when the simulation is restarted.
+
+The EIR simulation deliberately widens both elbow joints (`Joint_L5_L/R`) to
+approximately **-145 to +145 degrees** (`[-2.5307, 2.5307]` rad). This removes
+the previous -60-degree stop for the inward arm motion. It is a user-requested
+experimental override of the upstream `[-1.0472, 2.5307]` rad range, stored in
+both the URDF joint limits and ros2_control interface bounds. It does not
+establish the real robot's mechanical travel. Other joint, velocity, per-cycle
+increment, path and floor limits retain their current settings.
+
+The **Move both hands** checkbox applies the same world-coordinate jog to both
+targets; uncheck it to edit them independently. The GUI only sets hand TCP goals.
+The MPC chooses torso yaw/pitch with the arm joints while tracking both paths;
+the GUI displays the measured torso angles. In `config/eir_dual_mpc.yaml`,
+`torso_cost_weight` and `torso_pitch_cost_weight` prefer the first two entries
+of `nominal_posture` (both zero by default). Pitch centering also uses motion left free by the two hand
+tasks, so either torso axis can still move when a hand target requires it.
+The YAML is checked every 0.25 s. Online settings include all objective weights,
+`nominal_posture`, Cartesian speeds and ramps, joint velocity/increment bounds,
+smoothing, acceleration/torque bounds, joint-limit margin, floor settings,
+path tolerance and hard-filter enable, feedforward settings, short-move settings,
+IK settings, diagnostic settings, hold thresholds, solver iteration cap and input
+timeouts. The running model and ROS parameter values are updated together.
+Each live revision is validated before application; invalid values preserve the
+complete last valid live settings. Unknown parameter names are rejected.
+
+Robot identity, frames, topics/services, simulation/startup flags, input mode,
+`dt`, `horizon` and `prediction_model` require restart. Editing these produces
+`MPC YAML restart required (not applied live)`; supported tuning changes in the
+same file are still applied. Positive finite weights are required. Removing an
+online field restores its declared default if that default is valid for this robot.
+
+In RViz, choose **Interact** and use **Hand TCP controls** on either hand:
+XYZ arrows and plane handles change position; the three rings change orientation
+about world axes. Each marker edits only that hand's Desired TCP, even with the
+GUI's Move both checkbox on (that checkbox governs button jogs). The left center
+is cyan and the right center is orange. The GUI target values stay synchronized.
+Dragging does not start motion: use **Run MPC** to follow or pause. The display
+uses the Jazzy **Interactive Markers Namespace** `/eir/goal_markers`; select
+that namespace in an InteractiveMarkers display when using an older custom
+RViz profile. Its update topic is `/eir/goal_markers/update`.
+
+`left_hand_tcp` and `right_hand_tcp` sit on the actual CAD terminal flanges:
+`xyz=[0,0,0.097] m`, `rpy=[0,-1.57075,0] rad` relative to each `arm_link_7`.
+This is the official EIR gripper attachment transform; the STL end face is at
+97 mm, and TCP +X points out of the flange. No gripper length is assumed. RViz
+shows these two frames and the hand targets instead of every joint axis.
+
+Optional `EIR_ARM=left` or `right` retains single-arm operation with the same
+terminal TCP frames; the other joints are then locked at their initial pose.
+
+For a sourced ROS shell, the equivalent command is:
+
+```bash
+ROS_DOMAIN_ID=78 ros2 launch robot_mpc eir_sim.launch.py arm:=both
+```
+
+Use `rviz:=false gui:=false` for headless tests. Cost and command parameters
+are in `config/eir_dual_mpc.yaml` (`eir_mpc.yaml` for the right arm and
+`eir_left_mpc.yaml` for the left arm). The dual configuration uses soft path
+tracking (`cartesian_path_limit_enabled: false`). Each running and terminal
+action adds `0.5 * cartesian_path_cost_weight * (d_left^2 + d_right^2)`, where
+each distance is from the predicted TCP to its fixed start-to-goal segment,
+in metres. The explicit weight is **250000**, independent of the optional
+hard tube tolerance. Older configurations without this weight retain
+`1 / cartesian_path_tolerance^2` (2500 for 20 mm). This is a quadratic penalty,
+not a guaranteed maximum deviation. The weight reloads online with the other
+costs every 0.25 s; speed caps and the hard-filter flag also reload online.
+
+A changed desired pose starts a new segment at that hand's latest measured
+TCP. Identical repeated targets preserve the segment and its elapsed time.
+Tracking error alone cannot move the segment in soft mode. Continuously
+changing goals therefore generate continuously updated segments; they do not
+define one permanent straight line. Joint velocity and smoothing can round a
+corner after an abrupt target change.
+
+In soft mode, the output limiter scales the joint step uniformly to respect
+all per-joint rate bounds while preserving the MPC's joint direction. Physical
+joint bounds and the floor guard remain enforced. Joint limits are hard at the
+position-command boundary and margin-normalized soft costs in the MPC horizon.
+When a joint-limit guard activates, it reports the affected joints but does not
+reject a safe command merely because immediate hand tracking error rises.
+BoxFDDP's predicted state limits remain soft costs. No DLS/MPC command switching
+is used.
+
+With `cartesian_path_limit_enabled: true`, the controller additionally projects
+the command onto both hand paths with bounded linear least squares and checks
+the complete joint-linear steps. `mirror_path_hold` means this optional output
+filter could not certify a progressing step within its configured tolerance. It checks
+`p_right - diag(1,-1,1) p_left` against its start-to-goal segment. For symmetric
+goals this also limits one hand advancing ahead of the other. It is independent
+of joint limits; reachable endpoints alone do not guarantee this path condition.
+
+The dual EIR mock simulation uses `prediction_model: joint_acceleration`:
+`qddot = u`, with acceleration inputs bounded to 40 rad/s² per joint. This
+matches its position-command interface and is a kinematic MPC example; it
+does not establish dynamic feasibility or motor torque compliance. The
+`rigid_body` option retains ABA prediction with total torque inputs and URDF
+effort bounds. Restart the node to change the prediction model or time grid;
+configured input bounds and soft margins reload online.
+In the recorded stuck pose, the rigid-body model needed over 50 Nm of torso
+gravity compensation, exceeding its 50 Nm effort bound even at rest.
+
+The objective keeps both hand pose tracking (position `60000`, rotation `1500`), velocity tracking (`0.1`),
+acceleration input regularization (`0.0001`, configured through the historical
+`torque_cost_weight` key), arm posture (`0.05`), torso yaw posture (`0.01`), and
+torso pitch posture (`150`). The normalized joint-limit weight is `10.0` with a
+0.15 rad soft margin;
+command joint limits remain enabled and the hard Cartesian path filter is off.
+Actual TCP speed depends on the configured reference speed, posture and joint-rate
+bounds. A local ROS mock comparison using a `0.15 m/s` reference from the same
+initial states reduced peak segment deviation from 19.88 to 0.59 mm for a
+141 mm diagonal move and from 18.84 to 0.34 mm for a 150 mm sideways move.
+Both reached 3 mm / 1 degree in about 1.1--1.2 s. A 300 mm forward move took
+4.44 s with a final 2.37 mm error and minimum joint clearance 1.53 degrees.
+The measured callback maximum across these runs was 41.1 ms, below the 50 ms
+period; these finite measurements are not a real-time guarantee.
+The optional hard path tube is configured to 20 mm and disabled by default.
+Moves shorter than 10 mm additionally use the `short_move_speed` cap, bounded
+by the general Cartesian speed cap.
+The two-hand DLS velocity reference remains inside the MPC objective; MPC
+continues to produce every command. Both hands latch one joint pose once they
+are within 0.5 mm, preventing posture drift during a hold.
+
+The 2026-11-15 captured 86 mm stall was reproduced through ROS topics and
+mock ros2_control. With bounded projection and joint-acceleration prediction,
+two live runs reached 3 mm / 1 degree in 2.83–2.92 s. Final errors were
+0.18–0.21 mm / below 0.02 degree, with over 10 degrees of joint-limit clearance.
+The second run's sampled joint-linear command segments stayed within 1.45 mm
+of the hand paths and 0.38 mm of mirror symmetry. Callback maxima were below
+37 ms at a 50 ms period. These are measured simulation results, not a hard
+real-time guarantee or a guarantee for arbitrary goals.
+
+In a visible mock ros2_control run, a 300 mm forward/upward reach settled both
+hands within 3 mm for 0.5 s in 4.41 s. The following mirrored 100 mm X-Z square
+reached all five targets within 0.25 mm per hand; corner times were 1.11–2.29 s.
+Using one joint-state sample for both TCPs, peak left/right mirror error was
+3.15 mm during the reach and 0.81 mm during the square. Straight-line deviation
+from the original 300 mm reach was at most 10.1 mm per hand; reanchored path
+segments stayed within 5 mm. Torso pitch ranged from -6.77 to 3.78 degrees,
+because its zero-degree preference is soft. The two separately published TCP
+topics yielded up to 13.8 mm when compared without timestamp alignment;
+use the joint-state diagnostics for simultaneous comparisons. A 2 s reach while
+keeping this level of symmetry and path accuracy remains unverified.
+
+The GUI's **Controller** line shows `joint_position_limit_limited` or
+`joint_position_limit_hold` when the current motion is constrained, even while
+Run MPC remains checked, and lists the joint names currently at or beyond a
+position limit. A held position does not mean the requested goal was reached;
+if the hold persists, the target may need a different feasible configuration.
+Jog buttons
+change the goal once per click, so leaving Run MPC checked does not create a
+continuous jog. Duplicate F7 stop messages reset the solver only once.
+
+Starting requires fresh feedback for both hands and torso; run readiness
+requires fresh left/right hand targets. JSONL includes the left
+hand pose/error and preferred torso posture under `eir`, alongside the primary right-hand
+diagnostics. This simulation does not implement self-collision avoidance or
+EIR hardware control.
+
+Before the latest joint-limit cost and recovery changes, the shared controller
+was checked with delayed 18-joint feedback (0/20 ms)
+and hold disabled. Both-hand moves still passed with
+the solver iteration cap reduced from 5 to 3. In a ros2_control/GUI integration
+run, F7 remained held through repeated left-hand jogs, an elbow-limit stop and
+a reversed target. The blocked interval held a constant joint command;
+reversal reached 0.16/0.025 mm left/right hand error, and releasing F7 stopped
+motion. Solver p95 was 13.7 ms and full callback p95 was 15.8 ms (maximum
+20.25 ms); these measurements do not establish a hard real-time deadline.
+
+Those measurements describe the previous limit-hold behavior. The current
+regression replays the same constrained move and reversal while checking hard
+joint bounds and hand-path limits; it no longer requires a constant command at
+the limit. This local response is not a global reachable-workspace or
+self-collision planner, and needs a fresh runtime run after the changes above.
+
+With the default expanded elbows, the same inward 13 cm/upward 9 cm goal
+was reached in a ros2_control/GUI run at approximately -94 degrees left elbow,
+with 0.011 mm final left-hand error and a stationary held pose. Releasing F7
+and reversing the target worked. The sampled 0/40 ms replay trajectories had
+no nonadjacent CAD collisions, but the expanded interval as a whole is not
+collision-free: a fixed-ready-pose elbow sweep intersects the left wrist and
+torso near -123 degrees. No self-collision avoidance is added by widening limits.
+
+## Isaac Sim visualization
+
+Isaac Sim can display the EIR articulation by following the mock controller's
+ROS 2 `/joint_states` topic. Start the existing EIR simulation, then launch
+Isaac Sim from another terminal:
+
+```bash
+make docker-up-robot-sim
+FORCE_COLCON_BUILD=1 make docker-launch-eir-sim
+# In a second terminal; ISAAC_SIM_ROOT defaults to ~/isaacsim-6.0.1
+make isaac-eir-viewer
+```
+
+The EIR launch also opens the live MPC monitor. It plots TCP error, cost terms,
+solver and callback time, solver iterations/success, the MPC model `dt`, and the
+measured joint-command publication period/rate. Pass `plot:=false` to
+`ros2 launch robot_mpc eir_sim.launch.py` to disable it.
+
+The viewer opens `isaac_sim/eir.usd` and subscribes on ROS domain 78. Keep the
+EIR launch running, then check **Run MPC** in its GUI to move the Isaac model.
+To use another Isaac Sim install, set
+`ISAAC_SIM_ROOT=/path/to/isaac-sim` on the viewer command.
+
+The official cart and wheels are already in `meshes/eir/visual/base_link.glb`.
+The Isaac viewer opens the saved project stage at `isaac_sim/eir.usd` directly.
+That saved stage omitted the GLB cart geometry, so the viewer adds the converted
+official mesh from `isaac_sim/eir_base_link.usda`, then adds a ground surface,
+fill/key lights and closer camera framing in memory. It removes the temporary
+cart approximation and its invalid fixed joint from the loaded stage, without
+overwriting `eir.usd`. The saved ROS joint-state graph is reused and retargeted
+to the articulation.
+
+This is a one-way visualization: the existing mock ros2_control publishes the
+joint states that drive Isaac Sim. Isaac physics state is not fed back into the
+MPC, so this checks the MPC motion and model rendering, not coupled simulation
+or dynamic agreement between the two simulators.
+
 The URDF defines `hand_tcp` as a child of `tcp`. Its local translation and RPY
 are read from the `hand_tcp_fixed` joint in
 [`indy7.urdf`](../robot_description/urdf/indy7.urdf); changes to that mount offset
